@@ -5,16 +5,20 @@
 
 ## 先读什么
 
-**`docs/design_and_implementation.md`** ——唯一权威的设计文档，从头讲清楚
-系统现在的样子：解决什么问题、每个部件为什么这样设计、在真实 BlueField-3
-测试床上怎么跑到 1ms 控制周期。历史演进（方案 A/C/D 的取舍）不在这篇里，
-按需去 `rd_fairness_design_c.md` 和 `docs/archive/`。
+**`docs/design.md`** ——唯一权威的设计文档（2026-07-23 按现行实现重写），
+从头讲清楚系统现在的样子：解决什么问题、每个部件为什么这样设计、性质与
+实测定数。历史演进（方案 A/C/D 的取舍）不在这篇里，按需去
+`rd_fairness_design_c.md`、`rd_fairness_design_e.md` 和 `docs/archive/`。
+（旧的统一文档 `design_and_implementation.md` 已删除，由 `design.md` 取代。）
 
 ## 文件
 
-- `design_and_implementation.md` —— 主设计文档（统一版，见上）。
+- `design.md` —— 主设计文档（见上）；`design_en.md` —— 其英文版
+  （内容一致，审阅与修改以英文版进行）。
+- `planned_extensions.md` —— 三个计划中组件（多属主组合实证、对抗性
+  租户加固、在线政策重编程）的详细设计与实验方案。
 - `response_law_mimd_analysis.md` —— MIMD 响应律的理论分析、实验计划、
-  参数调优讨论；配套 `design_and_implementation.md` §7.1/§12。
+  参数调优讨论；配套 `design.md` §4/§8。
 - `rd_fairness_design_c.md`、`rd_fairness_design_e.md` —— 方案 C/E 的原始
   设计说明，均已被主文档取代，留作决策历史存档（各自文首标注了取代关系）。
 - `ops_notes.md` —— 平台缺陷病历与实验卫生规则，每条问题按"症状—根因—

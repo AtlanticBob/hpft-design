@@ -51,7 +51,7 @@ tools/cc_mode.sh pcc           # 拉起 PCC+HPFT 全栈（UPCC=1 + E 栈三件�
   soak/watchdog cron 两个方向都不自动碰，需要时手动去 crontab 注释/解注
   （`#MOTIV#` 前缀）。
 - 交换机 ECN 档位与 CC 无关，单独用
-  `paper/motiv_hetero_cc_20260714/motiv12_env.sh ecn off|neutral|aggr|gentle`
+  `paper/1-2_20260714/motiv12_env.sh ecn off|neutral|aggr|gentle`
   切（off=ecn_debug，neutral=ecn_incast_bzx 108K/396K/20%）。
 
 ## 验证切换是否真的生效
@@ -86,7 +86,7 @@ sudo mlxreg -y -d 38:00.1 --reg_name ROCE_ACCL --set "selective_repeat_forced_en
 fw reset 后要重设。`cc_mode.sh status` 可随时核对。
 
 16 流 RDMA incast 的干净对比（同 DCQCN、同普通建连、唯一变量=寄存器，
-数据在 `paper/motiv_hetero_cc_20260714/rdmaonly3_*`）：默认 ECN 下
+数据在 `paper/1-2_20260714/rdmaonly3_*`）：默认 ECN 下
 92.5G vs 91.2G（SR 略低 ~1.3%）；关 ECN 纯 tail-drop 下 **32.3G vs
 91.2G（2.8 倍）**——GBN 臂 7.1 万次 NAK、RTT 4.8ms、线上满线速全是
 重传；SR 臂零 NAK、RTT 0.77ms。附带观察：forced SR 的发送管线似乎
