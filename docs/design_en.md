@@ -1,16 +1,6 @@
 # HPFT: Virtual-Queue Fairness at the DPU Edge — Design
 
-**Version 3.1 (2026-07-24).** This document is the sole authoritative
-design description of the system. v3.1 replaces the sender-side law
-with the "track-and-audit" form (§3.4, §4.2, prompted by the
-fluid-model analysis in `design_theory.md`); the implementation still
-runs its thoroughly measured predecessor (the MIMD law, 1 ms period,
-direct vport measurement) — every component other than the law and the
-telemetry format matches this document, and the migration plus
-revalidation are pending. Historical decision logs, abandoned
-directions, and the older designs and law analyses this document
-supersedes all live in `archive/`; none of it is maintained alongside
-this document — **the implementation follows this document**. Operational procedures are out of scope — read
+**This document is the sole authoritative design description of the system, and describes the implementation as it runs.** Operational procedures are out of scope — read
 `ops_notes.md` before touching the lab and `cc_mode_switching.md` for
 CC-mode switching. A Chinese edition is kept at `design.md`.
 
@@ -195,8 +185,11 @@ virtual queues integrate the excess, audit out $s_f$, and the ruling
 is compressed into the target $u_f$ (③) → telemetry returns to the
 senders → each sender moves its rate cap $R_f$ one tracking step
 toward $u_f$ and enforces the pace (④) → next period's $r_f$ reflects
-the effect. Total loop delay is roughly 1–2 periods; the tracker's
-time constant covers exactly this staleness (§4.2).
+the effect. The telemetry loop itself (measure→audit→return→respond)
+takes roughly 1–2 periods, but what governs tuning is the **effective
+lag** $\tau_{\rm eff}$ ≈ 24 ms — dominated by the measurement window
+and actuation coalescing, not by the control period (§4.2). The
+tracker's time constant covers that staleness.
 
 ### 2.3 Why the flow-set is the unit of control
 
@@ -370,59 +363,140 @@ policy weight (a class ratio of 0.75 was measured): **not because it
 wanted less, but because the demand estimate misread "did not manage
 it this instant" as "does not want it".**
 
-The fix is a **backlog test** on the demand estimate. First compute a
-neutral reference $\hat s_f$ — the amount this tree would give $f$ by
-weight if *all* flow-sets were greedy (every demand set to infinity),
-i.e. $f$'s **pure weighted share**. With every demand infinite the
-only binding constraints left are the VMs' $MaxRate$, so $\hat s_f$
-**depends solely on policy and the current set of active flow-sets,
-never on any measured rate** — the yardstick itself is steady, moving
-only when membership or policy changes, which is exactly what lets it
-serve as a neutral reference. The test:
+The fix is a **backlog test** on the demand estimate, with a single
+criterion:
 
-$$r_f \ge \theta_b\,\hat s_f\ (\theta_b = 0.5)\ \Rightarrow\ f\ \text{is backlogged},\ D_f \leftarrow C'$$
+$$\text{any node on } f\text{'s path is saturated} \Longrightarrow f \text{ is backlogged},\ D_f \leftarrow C'$$
 
-A backlogged flow's demand is set to the root capacity $C'$ — a
-**finite** value larger than any node's share, enough to disable the
-demand cap at every layer (equivalent to infinity) while remaining a
-concrete number, because the $\hat e_f$ derived from it must be
-broadcast to the sender as a rate (§3.4). Such a flow claims its full
-weighted share and is no longer capped by its own momentary rate; a
-flow below the threshold keeps
-$D_f = r_f(1+\delta)$. Back to the example: when TCP drops to 18G,
-$18 \ge 0.5 \times 24.25$ holds, so it is still judged backlogged and
-still gets 24.25G — the sibling cannot take it, and jitter is no
-longer misread as yielding. A genuinely idle flow (say 2G, far below
-half its share) still reports $r_f(1+\delta)$, so its unused share is
-lent out as before and borrowing is intact.
+That is: from root to leaf, if the measured aggregate at *any* node
+$f$ traverses is already pressed against that node's capacity, $f$ is
+deemed to be in contention. A backlogged flow's demand is set to the
+root capacity $C'$ — a **finite** value larger than any node's share,
+enough to disable the demand cap at every layer (equivalent to
+infinity) while remaining a concrete number, because the $\hat e_f$
+derived from it must be broadcast to the sender as a rate (§3.4). Such
+a flow claims its full weighted share and is no longer capped by its
+own momentary rate; a flow with no saturated node on its path keeps
+$D_f = r_f(1+\delta)$. Saturation is declared at "measured aggregate ≥
+95% of the node's capacity" and released below 85%, **with the
+hysteresis held per node** — entering saturation switches off
+borrowing at that node and utilization drops with it, so without a
+band the system would oscillate between the two modes.
 
-Two honest notes. First, the hard threshold produces neither chatter
-nor bistability here: being judged backlogged raises the share, a
-raised share raises $r_f$, and the positive feedback latches the flow
-in the backlogged state; conversely a backlogged flow misjudged as
-idle climbs past the threshold in about 5 ticks on the 15%/period
-ladder — a short escape path. Second, the cost is real: a flow using
-almost exactly half its share occupies the whole allowance and no
-longer lends the unused part. $\theta_b$ is precisely the "ratio
-fidelity ↔ utilization" knob, 0.5 being the measured compromise;
-$\theta_b \to 0$ degenerates into a share floor (most accurate ratios,
-borrowing dead), $\theta_b \to 1$ into no test at all (liveliest
-borrowing, driftiest ratios).
+**Why this criterion.** Demand estimation infers "how much is wanted"
+from "how much was used", an inference valid only while the flow
+*could* have used more. At a saturated node that premise disappears:
+there is no surplus to yield, so a flow falling short of its share
+cannot be "yielding what nobody wanted" — it can only be losing it.
+This dovetails with §3.2.1's motivation: demand estimation exists to
+enable borrowing, borrowing is only meaningful when there is surplus,
+and with no surplus "this flow did not use its share" loses the
+meaning it had — the correct allocation is simply the weighted share.
 
-#### 3.2.3 Four quantities: what each is, and who consumes it
+Back to the example: on the tick TCP drops to 18G, the reason the
+sibling can swallow the 3.55G at once is precisely that the VM node is
+full — and a full node means the test fires, both classes claim their
+full shares, and the jitter is no longer misread as yielding. **This
+is not a coincidence: the ratchet only does damage when a sibling can
+immediately absorb the yielded capacity, which requires the node to be
+saturated.** Conversely, at an unsaturated node nobody takes the
+yielded capacity, so the misjudgment is harmless.
+
+**Why the criterion is "is the node full", not "how much did this flow
+use".** The latter is the more natural formulation (say, "below half
+your weighted share ⇒ not backlogged"), but it has two fatal flaws.
+First, **it puts a threshold on the one quantity the receiver cannot
+measure exactly**: a single dst's total comes from a hardware counter
+and is exact, whereas splitting that total across several senders is
+an estimate (§3.1); thresholding an estimate turns estimation error
+into policy. The saturation criterion has no such exposure:
+**however wrong the split, the per-sender estimates always sum to the
+exact total** (the split merely divides it), so "aggregate versus node
+capacity" is exact arithmetic. Second, its unique coverage is empty —
+the only case it alone would catch is "a node with no configured
+capacity, hence no definable saturation", and this design's premise is
+that every VM carries a sold bandwidth cap (§1.1), so such nodes do
+not exist in scope.
+
+Root congestion is this criterion's special case at the root node, not
+a separate mechanism: when the receiver downlink is filled the root is
+saturated and every flow-set beneath it is judged backlogged.
+
+**Misjudgment costs on two paths, both severe.**
+
+**First: it hands the victim's share to the aggressor as a legitimate
+target.** Measured (8 flow-sets over 97G, fair share 12.1G each): RDMA
+crushed to 4G; with the test not firing, its demand is reported as
+4.6G and TCP's ceiling becomes $24.25 - 4.6 = 19.65$G — **the receiver
+itself issues a licence for 62% above the fair share**. Once the
+aggregate of targets exceeds physical capacity, arbitration is handed
+back to the physical queue — where §1.2's signal asymmetry applies
+unchanged: TCP without ECN parks the queue above the marking band, and
+the class that obeys the signal is starved by its own compliance all
+over again (Jain 0.68, the RDMA class down to 15–16G in aggregate).
+With the test firing, the same scenario gives Jain 0.999 and 45–48G
+per class. **Once the allocator gets a share wrong, the very disease
+this system exists to cure reappears unchanged.**
+
+**Second: the ceilings become jointly infeasible, and the audit is
+structurally unable to recover.** $\hat e_f$ is the share computed with
+$f$'s own demand set to infinity and its siblings at their measured
+demands. If the siblings under one node are all underestimated, every
+flow computes an $\hat e_f$ close to the node's entire capacity, and
+exercising them together is roughly 2× oversend — while the audit
+discount is capped by $\gamma$ ($u_f \ge (1-\gamma)\hat e_f$) and can
+pull back at most 25%. **Against a 100% error the audit is not slow;
+it is structurally insufficient.** Measured: a dst capped at 30G, two
+senders steady at 58.7G combined. This path matters especially because
+it exposes a duality: the very boundedness of the discount that keeps
+the system from starving flows (§4.2) also means **the ceiling itself
+must not be wrong** — and what keeps it right is this test.
+
+Two honest notes. First, the test produces neither mode chatter nor
+bistability: being judged backlogged raises the share, a raised share
+raises $r_f$, and the positive feedback latches the flow in the
+backlogged state; once the node is no longer saturated, the lower edge
+of the hysteresis returns it to borrowing. Second, the cost is real
+and larger than any single measured figure: **while a node is
+saturated, borrowing at that node is switched off entirely** — a flow
+that genuinely wants only 1G out of a 12.1G share still occupies all
+12.1G. The measured cost in an all-greedy scenario is 98G → 94–95G of
+aggregate throughput, about 3–4%; but that is that scenario's number,
+not the mechanism's bound — the worst case is the sum of unused shares
+across all lightly-loaded but non-idle flows. Under §6's tuning
+principle (fairness before utilization) this trade is accepted.
+
+**How $\delta$ and the backlog test divide the work — the handover
+point is computable.** They are two lines of defence against the same thing. A
+class is capped by demand estimation below its weighted share when
+$\sum_f r_f(1+\delta) <$ that share; in steady state, if each flow
+realizes a fraction $\rho$ of its grant, the condition is
+$\rho\,(1+\delta) < 1$, i.e.
+
+$$\rho < \frac{1}{1+\delta} = 87\%\quad(\delta = 0.15)$$
+
+**Above a sustained realization of 87%, demand estimation simply
+cannot push a class below its share and the backlog test need not
+intervene** (which is why toggling the test made no difference in
+scenarios measured at 97% realization); below it, the test takes over.
+That covers steady state only: the test's other half of the job is the
+**transient** — a single-tick dip is cashed in by the sibling
+immediately while recovery has to climb one 15% rung at a time, and
+that asymmetry is independent of sustained realization. A
+steady-state experiment cannot disprove a transient mechanism.
+
+#### 3.2.3 Three quantities: what each is, and who consumes it
 
 | Quantity | How it is obtained | Who consumes it |
 |---|---|---|
 | $D_f$ demand estimate | $r_f(1+\delta)$; set above capacity if backlogged | the **input** to allocation |
-| $\hat s_f$ pure weighted share | one allocation pass with **every** demand set to infinity | **only** the yardstick of the backlog test (§3.2.2) |
 | $e_f$ entitled rate | the output of the allocation run on $\{D_f\}$ | ledger charge reference: only $r_f > e_f$ accrues debt (§3.3) |
 | $\hat e_f$ fair-share ceiling | one pass with **$f$'s own** demand set to infinity, siblings keeping $D$ | ledger drain reference (§3.3) + anchor of the target $u_f$ (§3.4) |
 
-Note the difference between $\hat s_f$ and $\hat e_f$: the former is
-the share when *everyone* is greedy — a neutral yardstick; the latter
-is the share when *only this flow* is greedy and everyone else carries
-on — this flow's ceiling. They coincide only when all flows are
-backlogged.
+The backlog test needs no fourth quantity: it compares the **measured
+aggregate at a node** with **that node's capacity**, both of which
+already exist and neither of which depends on the per-sender split
+(§3.2.2).
 
 #### 3.2.4 How the hierarchical allocation is computed
 
@@ -430,11 +504,10 @@ The tree is walked **twice**: **bottom-up to aggregate demand** (leaf
 $D_f$ summed layer by layer, with the VM layer then clipped by the
 purchased allowance: cap $= \min(MaxRate_d,\ \sum\text{subtree
 demands})$), then **top-down to allocate capacity** (root capacity
-poured down by weight, layer by layer). Both §3.2.2's $\hat s_f$ and
-this section's $e_f$ are products of these same two walks; they differ
-only in what is fed into the first one — $\hat s_f$ is fed infinite
-demands everywhere (so only $MaxRate$ still binds), $e_f$ is fed
-$\{D_f\}$.
+poured down by weight, layer by layer). Both $e_f$ and $\hat e_f$ are
+products of these same two walks; they differ only in what is fed into
+the first one — $e_f$ is fed $\{D_f\}$, while $\hat e_f$ replaces
+$f$'s own entry with infinity (§3.2.5).
 
 The allocation walk performs, at each node, **bounded weighted
 water-filling**: picture pouring into a row of cups. The water level
@@ -570,11 +643,23 @@ measurement spikes are absorbed by the integral (the AVQ lineage). The
 full scale $V$ is a wall-clock integral quantity (excess × time) and
 therefore **does not scale with the control period** — the same
 history of excess accrues the same debt whether it is ticked as fifty
-1 ms periods or one 50 ms period. $V$ is set to 600 Mbit (= 0.1 s × line rate × headroom: it takes
-roughly 100 ms of headroom-scale sustained excess to saturate the
-mark); the integral is clipped at $V$ itself — a deeper reservoir
-only makes the mark keep firing after the excess has stopped,
-deepening the undershoot.
+1 ms periods or one 50 ms period. $V$ is anchored to the **capacity of the resource being protected** —
+the same downlink bottleneck capacity $C$ the scheduler uses, recomputed
+together with it whenever the link speed changes:
+
+$$V = v_{sec}\cdot \text{headroom}\cdot C, \qquad v_{sec} = 0.2\ \text{s}$$
+
+i.e. "about 0.2 s of headroom-scale sustained excess saturates the
+mark". On this testbed $C$ = 100G (the receiver downlink is stepped
+down to 100G to create incast) ⇒ $V$ = 600 Mbit. **Anchoring to the
+bottleneck capacity rather than the NIC port line rate** matters: in
+the audit loop's damping $\zeta = \tfrac12\sqrt{kV/(\gamma\hat e)}$
+(§4.2), $\hat e$ scales with $C$, so $V$ must scale with it too for
+$\zeta$ to be independent of link speed; anchored to the port line
+rate, changing the bottleneck speed would silently change the damping.
+The integral is clipped at $V$ itself — a deeper reservoir only makes
+the mark keep firing after the excess has stopped, deepening the
+undershoot.
 
 **Draining must use $\hat e_f$, not $e_f$**, or the system deadlocks:
 $e_f$ is capped by estimated demand, and demand is derived from the
@@ -659,7 +744,8 @@ compressed into a target $u_f$ broadcast every period. Only one job
 remains for the sender —
 
 > track the rate cap $R_f$ quickly, stably, and without overshoot onto
-> a target $u_f$ that is externally known but 1–2 periods stale.
+> a target $u_f$ that is externally known but $\tau_{\rm eff}$
+> (≈ 24 ms, §4.2) stale.
 
 The classic Chiu–Jain analysis of increase/decrease fairness does not
 apply here because its premise — all sources share one binary feedback
@@ -679,14 +765,28 @@ periods and pulls it back, and the transient excess is absorbed by the
 tenant's own CC). On every telemetry record the sender does exactly
 one thing — **it takes one step toward the target on the log axis**:
 
-$$R_f \leftarrow R_f\left(\frac{u_f}{R_f}\right)^{kT}
-\qquad\Longleftrightarrow\qquad
-\dot R_f = k\, R_f \ln\frac{u_f}{R_f}$$
+$$\dot R_f = k\, R_f \ln\frac{u_f}{R_f}
+\qquad\Longrightarrow\qquad
+R_f \leftarrow R_f\left(\frac{u_f}{R_f}\right)^{\,1-e^{-k\Delta t}}$$
 
-This is first-order low-pass tracking in log coordinates (with
-$z = \ln R_f$ it is the textbook $\dot z = k(\ln u_f - z)$): no
-branches, no clamps, a single parameter $k$ = 20 s⁻¹ (time constant
-50 ms; within the 5% band in about $3/k$ = 150 ms). Log coordinates
+The law is defined in continuous time (with $z = \ln R_f$ it is the
+textbook $\dot z = k(\ln u_f - z)$); the discrete update on the right
+is its **exact** integral over the interval $\Delta t$ that actually
+elapsed, not over the nominal period. The distinction is a correctness
+requirement, not a precision refinement: no implementation ticks
+perfectly evenly (periodic slow work consumes several periods,
+telemetry can arrive late), and integrating over the real interval
+fills such gaps exactly. More importantly, **the exponent
+$1-e^{-k\Delta t}$ always lies in $(0,1)$**, so however long the gap,
+the update converges toward the target and can never cross it —
+whereas the lazy fix of writing $k\Delta t$ to compensate a gap sends
+the exponent far above 1, and a few hundred milliseconds of silence
+would launch the rate to absurdity.
+
+This is first-order low-pass tracking in log coordinates: no branches,
+no clamps, a single parameter $k$ = 20 s⁻¹ (time constant 50 ms; the
+rate enters ±5% of target in about $2.6/k$ = 130 ms, the same yardstick
+§8.3 uses). Log coordinates
 for the same reason as everywhere in this design: they are the natural
 space of multiplicative dynamics — shares of any size see the same
 relative step and the same convergence wall-clock, both classes share
@@ -724,12 +824,23 @@ Two tuning properties (derivations in `design_theory.md`):
 
 **$k$'s ceiling comes from target staleness.** Every flow's $u_f$ is
 computed under a "siblings stay put" assumption and is
-$\tau_{\rm eff}$ ≈ 15–25 ms stale. Far from the target, log tracking's
+$\tau_{\rm eff}$ stale. $\tau_{\rm eff}$ is the **effective lag** —
+control period + telemetry round trip + half the measurement window +
+actuation coalescing — about 24 ms on this testbed, **dominated by the
+measurement window and the actuation coalescing, not by the control
+period** (which contributes 1 ms). Far from the target, log tracking's
 absolute climb speed is self-bounded by $x\ln(u/x) \le u/e$ ($e$ =
 Euler's number), so the joint climb of all flows never exceeds
 $(k/e)\sum u$ — self-normalized by the targets, not amplified by flow
-count. Staleness budget: $k\,\tau_{\rm eff} \lesssim 0.4$; the
-production value sits inside it.
+count; the joint transient overshoot within a staleness window is
+about $(k/e)\tau_{\rm eff}$. Hence the budget
+$k\,\tau_{\rm eff} \lesssim 0.4$ (roughly 15% transient overshoot).
+The production point sits at $k\tau_{\rm eff}$ = 0.48, **slightly above
+that rule of thumb** — about 18% overshoot, absorbed by the VQ's
+integration, the switch buffer, and tenant CC; no resulting oscillation
+or worsened startup peak has been observed. To buy margin, shorten
+$\tau_{\rm eff}$ (measurement window or actuation coalescing) rather
+than lowering $k$.
 
 **The audit loop's damping is tunable.** The tracking term $-kz$
 supplies exactly the damping that the "integral ledger + proportional
@@ -783,23 +894,72 @@ the safety net:
 
 ### 4.4 Fail-open
 
-The law's increase is conditioned on fresh, uncongested telemetry
-(§3.4), so a telemetry blackout has a well-defined degradation path: if
-a flow-set receives no record for $N_1$ consecutive periods (0.25 s),
-$R_f$ freezes (no increase, no decrease); after $N_2$ periods (2 s),
-$R_f$ ramps at a fixed slope toward $Tree_f$. Semantics: when the
-receiver DPU or the telemetry path fails, traffic degrades to being
-constrained only by sender-local policy — tenants are not wedged
-(fail-open), yet nothing runs away ($Tree_f$ caps the ramp, and tenant
-CC still operates). Once the receiver returns, the first mark restores
-control.
+The tracking law is conditioned on receiving fresh targets (§3.4), so a
+telemetry blackout has a well-defined degradation path: after $N_1$
+(0.25 s) of silence for a flow-set, $R_f$ freezes (no increase, no
+decrease); after $N_2$ (2 s), **the same tracking law drives $R_f$
+toward $Tree_f$** — only the target is swapped for the
+sender-locally-permitted allowance. No second rate constant is
+introduced and no extra clamp is needed: tracking is asymptotic and
+structurally cannot cross $Tree_f$. Semantics: when the receiver DPU or
+the telemetry path fails, traffic degrades to being constrained only by
+sender-local policy — tenants are not wedged (fail-open), yet nothing
+runs away ($Tree_f$ caps it, and tenant CC still operates). Once the
+receiver returns, the first target restores control.
+
+**Forgetting a flow-set.** The two levels above only answer "temporarily
+unheard"; there remains "never coming back" — a finished flow-set must
+not be driven forever. The rule: forget its state after $N_3$ (30 s)
+without reports, **but only while the telemetry channel is confirmed
+alive** — the test being that other flow-sets from the same sender are
+still arriving. The gate is not optional: looking at one flow-set's
+record stream alone, "this flow ended" and "the whole channel died" are
+indistinguishable, and forgetting without the distinction would let a
+single channel failure evict every flow-set at once, losing the
+$Tree_f$ cap along with them — precisely the runaway fail-open is
+defined to exclude. In the **aggregate** view the two are perfectly
+distinguishable: a real channel failure silences every flow-set
+simultaneously. Forgetting deliberately does **not** release executor
+state: the executor retains the last rate it was given, so a forgotten
+flow-set stays limited by it — it can only get slower, never faster.
 
 ## 5 Executors
 
 ### 5.1 The contract and the two-loop split
 
 Both executors obey one contract: **pace delays packets, never drops
-them**; the actual send rate = min(what tenant CC wants, $pace_f$). The
+them**; the actual send rate = min(what tenant CC wants, $pace_f$).
+
+The contract binds the **transition**, not just the steady state: the
+enforced rate must not change so abruptly that the transport treats it
+as failure — which in effect is dropping, defeating the contract's
+purpose. The law's own output satisfies this by construction (the
+target moves with time constant $1/k$, so the budget shifts only a few
+percent between refreshes); what needs limiting are **steps injected
+from outside**, typically a large operator policy cut, which reaches
+the executor directly through the sender tree ($Tree_f$ in
+$pace_f = \min(R_f, Tree_f)$ is not tracked). The evidence is
+unambiguous: a single 20× cut risks driving RDMA connections into
+terminal failure, while **the same low rate is perfectly safe in steady
+state** — the hazard is the ratio of the drop, not the destination
+rate. Large cuts are therefore applied over several periods in
+software. This does not weaken the selling principle: the hardware rate
+limiter (§4.3, layer 1) enforces the new allowance immediately, and the
+software ramp only shapes the trajectory. (Contrast with the deleted
+descent ramp: that one limited *all* descent, including the law's own,
+making the executor rather than the law the convergence bottleneck;
+this limits only externally injected steps and is orthogonal to the
+law's dynamics.)
+
+The contract carries an easily overlooked dimensional requirement:
+**pace and measurement must use the same byte accounting** — both
+count wire bytes, headers and inter-frame gap included. If an executor
+meters in the application's or kernel's view (a GSO super-packet
+carrying one header copy, no inter-frame gap) while measurement reads
+the NIC's wire counters, the mismatch is a constant gain error in the
+loop and shows up directly as that class steadily overshooting its
+share (measured at 8%). Sensor and actuator sharing one accounting is
+the precondition for a loop without static bias. The
 tenant's congestion control keeps running underneath the pace, and the
 two loops do not excite each other: to tenant TCP the pace looks like a
 smooth pipe (the OnRamp-style argument); for RDMA, the
@@ -809,23 +969,46 @@ timescales — **sub-period bursts and fabric congestion belong to
 tenant CC** (CNP reaction is sub-millisecond); **policy shares at
 period scale and above belong to HPFT**.
 
-### 5.2 RDMA: water-level control of per-pair budgets
+### 5.2 RDMA: direct assignment of per-pair budgets
 
 RDMA pacing lands on the DPU's programmable congestion-control (PCC)
 engine, invisible to tenants. The sender agent pushes $pace_f$ down as
-a **per-pair budget**; the device maintains one water level $level$ per
-pair, applies rate = min($cc$, $level$) to **every QP** of the pair,
-and closes the loop on the measured pair-aggregate rate: shrink the
-level proportionally when the aggregate exceeds the budget, raise it in
-small steps when below. The essence of water-level control is **O(1)
-state, no flow counting**: the equilibrium level lands on budget/N
-automatically, so the aggregate converges to the budget for any QP
-count — this is where §2.3's flow-count immunity is cashed in at the
-executor (the anti-collapse floor must likewise clamp the *aggregate*
-rate, not the per-QP rate, or floor × N becomes the escape channel).
-Rate feedback prefers the receiver-measured value carried back in
-telemetry: it shares a source with the marks and is immune to
-sender-side event-sampling loss.
+a **per-pair budget**; the device applies rate = min($cc$, $level$) to
+**every QP** of the pair, so the aggregate is $N \times level$ ($N$ =
+the number of QPs carrying that pair's data). The level that delivers
+the budget is therefore
+
+$$level = budget / N$$
+
+— **assigned directly, not searched for**. The budget arrives from the
+mailbox and $N$ is counted from the event stream; both are known, and
+nothing needs to be approached by feedback. This is §4.2's principle
+one level down: **when the target is known, computing beats converging
+to it**. The executor is not an independent convergence process but a
+translation of a known policy target into hardware parameters.
+
+Approaching that known value by integration has a concrete price: it
+needs a step size, clamping, a floor against digging without bound, and
+a settling window to avoid integrating measurements that have not
+caught up. One large budget cut excites all four at once and produces a
+limit cycle of several seconds (measured: budget 11.25G while the wire
+held 29.3G for about 2 s, after which the level crossed the target,
+dug to its floor, and both flows stalled for about 3 s). With
+assignment the limit cycle disappears and aggregate utilization *rises*
+from 97% to 99% — the under-delivery during the search is gone too.
+
+One point about $N$ must be stated: **count only the QPs carrying that
+pair's data, excluding the transport's reserved management queues**
+(RoCE's QP0/QP1 are owned by the kernel, exist whenever the port does,
+and generate events while carrying almost no bytes). Counting them
+into $N$ lets them each occupy $1/N$ of the share without using it, so
+the delivered budget is systematically low (measured: $N$ read as 5
+against 4 data QPs, delivering 4/5). This is not an artifact of a
+measurement tool; every real deployment has it.
+
+Pushing per pair and dividing by $N$ inside the pair is exactly where
+§2.3's flow-count immunity is cashed in at the executor: a tenant
+opening more QPs only slices the same budget more finely.
 
 The $cc$ term is a device-side DCQCN-flavored state machine
 (CNP-triggered multiplicative decrease normalized by QP count, periodic
@@ -846,14 +1029,28 @@ channel to a cadence the executor can digest, and policy shares are
 slow variables anyway, so the down-rating costs no semantics.
 
 **The descent direction carries no rate limit.** When the target drops,
-the budget follows in one step and the executor's proportional
-feed-forward (scaling its level by the ratio of new to old budget)
-catches up in one step — for a monotone descent that is both correct
-and fastest. The outer loop is already smooth (the tracking law moves
+the budget follows in one step and the level is recomputed with it —
+for a monotone descent that is both correct and fastest. The outer loop is already smooth (the tracking law moves
 with time constant $1/k$, §4.2), so there is no high-frequency
 back-and-forth needing extra damping; adding a descent ramp would only
 make the executor, rather than the law, the convergence bottleneck and
 throw away the law's descent capability.
+
+**Provenance of the feedback quantity: what is measured and what is
+estimated.** The $r_f$ fed back by the receiver is not a homogeneous
+quantity (§3.1): the **per-dst-VF total** comes from a hardware counter
+and is exact and fresh every period, whereas its **division among
+several senders** is an estimate from flow-table byte ratios with
+second-scale lag. An error in the latter is not a loss of precision but
+a qualitative failure — before a new sender's bytes appear, all of its
+traffic is credited to its partner (measured: two flows of 29G each
+reported as 58.3 / 0.00). Hence a usage rule: **tests may use the
+total; anything driving an executor's inner loop must be immune to a
+mis-split**. Concretely, the saturation test (§3.2.2) uses only totals
+and is therefore exact, while the per-pair rate fed to the executor
+falls back to the previous period's grants as its prior whenever some
+members have not yet been measured, rather than trusting a byte ratio
+that is not yet credible.
 
 ### 5.3 TCP: host-side EDT pacing
 
@@ -863,9 +1060,18 @@ time, and the fq qdisc enforces it (a mature delay-only shaping path;
 zero copy, zero drops). The sender agent writes rates into the BPF map
 across a one-hop UDP bridge (tens of microseconds steady state), so the
 control-loop shape is identical to the RDMA side; only the enforcement
-point differs. Sparse flows — inter-packet gaps above 40 µs — bypass
-the shared pacing: latency-sensitive small flows pay no queueing tax
-for the shaping of throughput flows. Placing the TCP executor on the
+point differs. **Sparse-flow bypass**: latency-sensitive small flows pay no queueing
+tax for the shaping of throughput flows and may skip the shared pacing.
+The bypass predicate must be **one a throughput flow cannot satisfy** —
+"inter-packet gap above 40 µs" alone is not: with TSO enabled a bulk
+flow presents as big-burst-plus-big-gap, passes the same test, and the
+shaping becomes vacuous (a pair was measured sustaining 1.13–1.46× its
+pace). The predicate is therefore the conjunction of three necessary
+conditions: **the flow has genuinely been idle (gap > 40 µs), this
+send is genuinely small (not a TSO super-packet), and the pair's
+accumulated debt is within one burst**. The first two exclude
+throughput flows disguised as sparse; the third caps the bypass itself,
+bounding the aggregate escape even under many small flows. Placing the TCP executor on the
 host rather than the DPU is a settled architectural conclusion (the
 negative result on DPU-side TCP offload is recorded in
 `docs/archive/superseded-designs.md`).
@@ -886,34 +1092,40 @@ back on the ledger side). Production values (ground truth is the
 
 | Parameter | Value | Role |
 |---|---|---|
-| $T$ | 1 ms | control period; total loop lag ≈ 1–2 $T$ |
-| $k$ | 20 s⁻¹ | tracking bandwidth (time constant 50 ms; staleness budget $k\tau_{\rm eff} \lesssim 0.4$) |
+| $T$ | 1 ms | control period. Under v2 it is **no longer a dynamics parameter** (the law discretizes over the measured interval; $V$ and all timeouts are wall-clock). Two roles remain: the per-tick budget (per-tick work is $O(N)$ independent of $T$, so doubling $T$ doubles flow-set capacity) and its contribution to $\tau_{\rm eff}$. Raise $T$ to scale up, at the cost of an equal rise in $\tau_{\rm eff}$, to be repaid by lowering $k$ proportionally |
+| $\tau_{\rm eff}$ | ≈ 24 ms | **effective lag**; it sets $k$'s ceiling. Composition: control period 1 + telemetry RTT 0.1 + half the measurement window 10 + actuation coalescing 13. To go faster, shorten these — not $T$ |
+| $k$ | 20 s⁻¹ | tracking bandwidth (time constant 50 ms; staleness budget $k\tau_{\rm eff}$ = 0.48, see §4.2) |
 | $\gamma$ | 0.25 | audit-discount cap (target floor $(1-\gamma)\hat e_f$; damping $\zeta = \tfrac12\sqrt{kV/(\gamma\hat e_f)}$) |
 | $\delta$ | 0.15 | demand growth margin (a zero-sum tax; must stay small, §3.2) |
-| $\theta_b$ | 0.5 | backlog test threshold (fraction of pure weighted share, §3.2) |
+| node saturation test | enter 95% / leave 85% | the backlog test's single criterion: any saturated node on the path ⇒ backlogged; hysteresis held per node (§3.2.2) |
 | headroom | 3% | ledger capacity's concession to physical capacity |
-| $V$ | 600 Mbit (= 0.1 s × line rate × headroom) | mark full scale; integral clip = $V$ |
-| $N_1$, $N_2$ | 0.25 s, 2 s | fail-open freeze / ramp thresholds |
-| pace floor | 50 Mbps | enforcement lower bound; keeps executors out of their stall regions |
+| $V$ | $v_{sec}\cdot$headroom$\cdot C$, $v_{sec}$ = 0.2 s; $C$=100G here ⇒ 600 Mbit | mark full scale; integral clip = $V$; $C$ is the scheduler's downlink bottleneck capacity, recomputed on link-speed changes (§3.3) |
+| $N_1$, $N_2$, $N_3$ | 0.25 s, 2 s, 30 s | fail-open freeze / takeover / flow-set eviction (§4.4) |
+| pace floor | 50 Mbps | numerical lower bound: keeps $u_f > 0$ (the log law's domain) and above the executor's quantization step |
 
 ## 7 Implementation at a glance
 
 | Component | Runs on | Form |
 |---|---|---|
-| rx agent (measure · allocate · mark · telemetry) | receiver DPU Arm | Python, single-process 1 ms loop |
+| rx agent (measure · allocate · audit · telemetry) | receiver DPU Arm | Python control flow + C allocation hot path |
 | vport sampler (hardware class-bucket counters) | receiver DPU Arm | C, shared-memory publisher |
-| tx agent (response law · sender tree · dispatch) | sender DPU Arm | Python |
-| RDMA executor (per-pair water-level control) | sender DPU DPA | DOCA PCC device C |
+| tx agent (tracking law · sender tree · dispatch) | sender DPU Arm | Python |
+| RDMA executor (per-pair budget → per-QP rate, direct assignment) | sender DPU DPA | DOCA PCC device C |
 | TCP executor (EDT pacing) + bridge | sender host | tc eBPF + Python |
 
-The control plane totals about 1,800 lines of Python (the v2 migration
-deleted v1's three law skeletons and their clamps, a net −300 lines); the
-executors about 1,100 lines of DPA C and 250 lines of eBPF C. The single source
-of truth for policy and parameters is the registry file (the repo copy
-is authoritative; the receiver hot-reloads the policy section on file
-mtime). At the 1 ms period each agent stays below 9% of one core; one
-scheduling pass takes 448 µs at 20 flow-sets; the comfortable scale is
-several hundred flow-sets. The code map is in
+The split of languages follows one rule: **per-tick arithmetic over
+the flow-set array is C; I/O, parsing, configuration and control flow
+are Python**. The three-layer allocation hot path is therefore C
+(~200 lines), the rest of the control plane about 1,800 lines of
+Python; the executors about 1,100 lines of DPA C and 250 lines of eBPF
+C. A pure-Python allocation implementation is retained as a reference
+and cross-checked point-by-point against the C — a discipline that has
+caught real defects. The single source of truth for policy and
+parameters is the registry file (the repo copy is authoritative; the
+receiver hot-reloads the policy section on file mtime). Scale: about
+200 flow-sets at the 1 ms period, **bounded by the sender** (it
+recomputes the whole sender tree on every telemetry record); each
+agent stays below 9% of one core. The code map is in
 `hpft-implementation/README.md`; platform defects and experiment
 hygiene are in `ops_notes.md`.
 
@@ -956,23 +1168,20 @@ mapped systematically.
 
 ### 8.3 Measured results
 
-The table below was measured on the **v1 transitional form (the MIMD
-law plus the executor descent ramp)**; provenance in
-`evaluation_index.md` and the per-directory `results/*/summary.md`.
-v2 leaves the fairness, measurement, fail-open, and overhead
-dimensions mechanically unchanged; the convergence dimension changes
-with the new law and the removal of the descent ramp — predictions
-(~130 ms up, ~150 ms down, symmetric) and the revalidation plan are in
-`design_theory.md`:
+The table below was measured on the current implementation;
+provenance in the per-directory `results/*/summary.md`.
 
 | Dimension | Result |
 |---|---|
-| Step convergence (20G↔10G, competitor leaves/joins) | up ~59 ms; down ~580 ms |
-| Incast symmetric fairness (8 flows, sustained contention) | Jain 0.999–1.000 |
-| Measurement accuracy | byte-exact reconciliation vs. host counters; 0.36% steady-state error under incast |
+| Step convergence (20G↔10G, competitor leaves/joins) | up 121–132 ms; down 93/94 ms |
+| Deep-pit recovery (climb back after a 20x policy cut) | 198/204 ms |
+| Incast symmetric fairness (8 flows, sustained contention) | Jain 1.000; 96G aggregate at 99% utilisation |
+| Multi-sender fairness on one dst | Jain 1.0000; 14.22±0.07 / 14.30±0.01 |
+| Measurement accuracy | byte-exact reconciliation vs. host counters; 0.36% steady-state error |
 | Telemetry | 0.1 ms in-band round trip; one fixed-size record per flow-set per period |
-| Fail-open timing | freeze at 0.25 s of blackout, ramp at 2 s; back under control within 1 s of recovery |
-| Control-plane overhead | each agent < 9% of one core; one scheduling pass 448 µs at 20 flow-sets |
+| Fail-open timing | freeze at 0.25 s of blackout, track Tree_f at 2 s; back under control within 1 s of recovery |
+| Policy cut enforcement | hardware limiter in 14 ms; software tree completes in 40–47 ms |
+| Control-plane overhead | under 9% of one core per agent; 448 µs per scheduling pass at 20 flow-sets |
 
 ## 9 Boundaries and extensions
 
@@ -1009,28 +1218,12 @@ speed, making policy a live control input.
 
 ## 10 Document genealogy
 
-**Live documents** (maintained alongside this one):
+**Current** (maintained alongside this document):
 
-- `design_theory.md` — fluid-model analysis of the response loop
-  (tutorial-style, Chinese): general method, equilibrium/convergence/
-  stability derivations reconciled against measurements, parameter
-  rules. The rationale for §6's parameter values lives here; its
-  critical findings (the clamp family's monotonicity defect,
-  slew-bound down-steps, the drain dead-zone) prompted the
-  track-and-audit law of §3.4 and §4.2.
+- `design_theory.md` — fluid-model analysis of the response loop:
+  equilibrium, convergence and stability derivations reconciled with
+  measurement, plus the tuning rules. The reasoning behind every §6
+  value lives there.
 - `ops_notes.md` (required reading before touching the lab) and
-  `cc_mode_switching.md` (CC-mode switching).
-- `planned_extensions.md` — the three committed but unstarted
-  extensions.
-- `evaluation_index.md` — index of paper material; its numbers date
-  from the old configuration era, with generations and trustworthiness
-  in `hpft-implementation/results/EXPERIMENT_STATUS.md`.
-
-**Archived** (`archive/`, for provenance only — mechanisms and
-parameters are all outdated): the original Scheme-E design with the
-Q1–Q27 decision log, Scheme C, the AIMD/MIMD law analyses, abandoned
-directions, tuning and diagnostics logs, handoff history. Law lineage:
-AIMD → (2026-07-13) MIMD → (2026-07-24) the log-space tracking law;
-MIMD is the thoroughly measured transitional form (§8.3's numbers are
-its record), and the three-law comparison is in
-`archive/response_law_mimd_analysis.md`.
+  `cc_mode_switching.md`.
+- `planned_extensions.md` — three scoped but unstarted extensions.

@@ -99,6 +99,24 @@ fabric 路径（VF 与 SF 皆然）出现空载 RTT 尖峰 10-200ms（正常 0.1
 超过 fail-open 阈值造成间歇性控制面失守。规则：变速类实验尽量减少翻转
 次数，相邻实验之间用 `ping -c 100 -i 0.05` 验证 fabric 干净再开跑。
 
+**⚠ 别把 megaflow 冷启动税误判成这个病（2026-07-24，白等 7.5 小时的教训）。**
+间歇探测（或拓扑刚建好）时，OVS 的 megaflow 表项空闲被逐出，每一轮的
+**首包**走 DPU 慢路径 20-100ms，热路径立刻回落 0.04ms——这不是变速病，
+不用等，一预热就没。当时判净标准误取了"含冷启动的 ping max"，于是永远
+达不到、白等自愈。**鉴别方法（真病 vs 假李鬼）：**
+
+| | 真·变速病 | 假·megaflow 冷启动税 |
+|---|---|---|
+| 触发 | 反复变速后 | 任何间歇探测、拓扑刚建好 |
+| 表现 | **连续** ping 也持续尖峰 | 只有**首包**慢，热路径立刻 0.04ms |
+| 自愈 | ~1 小时 | 不用等，一预热就没 |
+| 判据 | `ping -c 100 -i 0.05` 的 **avg** 仍高 | avg 干净，只有 max 高 |
+
+**规则订正：判 fabric 干净一律看 `ping -c 100 -i 0.05` 的 avg（≈0.04ms
+为净），不看 max。** avg 也高才是真病该等，只有 max 高就是冷启动、直接
+开跑。（原规则只说"用 ping 验证"没说看哪个统计量，正是这个歧义导致了
+误判。）
+
 **SF bounce 会掉 IP；OVS 重启会掉分类规则。** `ip link set enp3s0f1s0
 down/up` 抹掉其上的 10.1.9.x 地址（带内遥测双端全断）；OVS 重启抹掉
 rx_agent 的三条分类 OpenFlow 规则。恢复：重加 IP + 重启 rx_agent
@@ -150,3 +168,76 @@ TCP 间歇性走错 VF egress（源地址路由 + 跨对 rp_filter=2/arp_ignore=
 把流钉死在指定 VF。规则：任何多 VF 并发 TCP 实验一律 %dev 强绑定。
 （这也提示一个真实加固点：混合流量下 TCP 从非零突然归零应回退 megaflow
 归因而非直接 fail-open——记为设计待议。）
+
+## 三套实验环境的快速切换（lab_env.sh，2026-07-24）
+
+lab 现在有三套互斥的实验环境，用 `hpft-implementation/tools/lab_env.sh`
+（在 sgpu01 上跑）一条命令切换，别再手工拼 cc_mode.sh + 拓扑：
+
+- **hpft**：PCC+HPFT 生产栈（UPCC=1、doca_pcc、rx/tx agent、pace-shim、
+  直连拓扑、带内遥测）。评估实验用这套。
+- **plain**：固件原生 DCQCN（UPCC=0）、无 HPFT、无 Jakiro、直连拓扑。
+  **motivation 实验（1-1/1-2）的基线就是这套。**
+- **jakiro**：固件 DCQCN + VxLAN overlay（ovsbr-p1 + vxlan100）+ 接收端
+  decap 点的 Jakiro DHTB。motiv 1.3 的对比环境。
+
+`lab_env.sh status` 只读，先看当前在哪套再切。
+
+三套环境差在**四个轴**，不只是 CC 模式：UPCC/CC、HPFT agents 死活、
+数据面拓扑（VF representor 挂 underlay-p1 还是 ovsbr-p1）、Jakiro 死活、
+VF IP 方案（直连 vf_i=10.1.i.x vs Jakiro 单 overlay IP 源 10.1.0.{11..14}
+→ 目的 10.1.0.2）、p1（100G/underlay vs 200G/直挂 underlay IP）。
+
+**两个必须知道的坑**（lab_env.sh 已内建处理，手工切时照做）：
+
+1. **fw reset 不清 OVS。** 从 jakiro 切回 hpft/plain 时，光做 fw reset
+   （cc_mode.sh 内含）**不会**删掉 ovsbr-p1——OVS 配置跨 reset 持久，
+   孤儿 ovsbr-p1 会把 VF representor 一直扣在自己身上、不在 underlay-p1
+   上，直连数据面就一直不通。必须显式 `del-br ovsbr-p1` + 把 representor
+   加回 underlay-p1（lab_env.sh 的 teardown_overlay 干这个，是
+   build_overlay 的逆操作）。**症状：cc/agents 看着全对，但跨主机数据面
+   完全不通**——先查 `ovs-vsctl list-ports ovsbr-p1` 有没有残留。
+2. **reboot_recover.sh 不管 representor 摆放。** 它只补遥测 IP + VF +
+   EDT，假定 OVS DB 里直连配置已在。所以 VxLAN 拆除这步 lab_env.sh 必须
+   自己做，不能指望 cc_mode.sh pcc 顺带修好。
+
+## 多对并发 RDMA 必须从一开始就限速（2026-07-27）
+
+**症状**：8 对 RDMA 并发时，其中固定的 2 对报 `Completion with error at
+client` 并且**永不恢复**，另外 6 对正常。看起来像"某些流对坏了"，极易
+误判成 fabric 故障或 flowtag 问题。
+
+**它不是**。同样那两对：单独跑 27 G 正常，两两并发正常，ICMP 全通，
+RP 里根本没有它们的预算条目。真正的原因是**启动瞬态的聚合过载**——
+8 条无限速 RDMA 每条能跑 ~27 G，合计 216 G 灌进 100 G 下行，RC 重传
+风暴打死其中几个 QP，而 RC 的错误完成是**终态**，QP 不会自己回来。
+哪几条死是由启动顺序决定的，所以看起来"确定性"。
+
+**判别**：给每条流加硬件限速使聚合低于链路容量再跑一遍。实测 8 对
+各 `--rate_limit=10 --rate_units=g`（合计 80 G < 100 G）后，**8 对全部
+正常**（9.70–10.39 G），包括原先必死的两对。
+
+**规则**：任何多对并发 RDMA 实验，**聚合需求必须从第一个包起就低于
+瓶颈容量**。两种做法——用 `--rate_limit` 给每条流设硬件档位，或者让
+被测系统在流量起来之前就已经把限速下发下去。**不要依赖控制环"1–2 个
+周期内收敛"来兜住启动瞬态**：那两个周期里 QP 已经死了，之后收敛得再
+准也救不回来。
+
+**对 HPFT 实验的具体影响**：新流集合以 $R = Tree_f$ 乐观起步（design.md
+§4.2），$N$ 条流对同时起步时聚合是 $N \times Tree_f$，可以远超瓶颈。
+设计里"瞬态超额由租户 CC 的即时反应兜底"这句话对 TCP 成立，**对 RDMA
+不成立**——RC 的错误完成不可逆。所以多对 RDMA 场景的 runner 要么错开
+启动，要么给 perftest 加 `--rate_limit`。
+
+**同一家族的第二种触发：瞬时大倍率降速。** 单对 RDMA 在 cap 20 G→1 G
+的**一步 20 倍**政策降幅下，3 次里有 1 次线上归零且不再恢复。对照实验
+排除了两个嫌疑：稳态低速率**不危险**（cap 3 G/2 G/1 G 各跑 25 s，线上
+2.72/1.78/0.87 G，实现率 87–91%，无死亡）；PCC 水位控制也**不是元凶**
+（线上归零时 `err = bud − 0 > 0`，水位每周期反而上抬 12.5%，控制器一直
+在救）。所以危险的是**降幅本身**，不是终点速率。
+
+这修正了一条旧记载："RP 在 ≲1 G 预算下卡死"——真正的条件不是预算低，
+而是**一步降得太狠**。控制律自身不会产生这种阶跃（目标以 1/k = 50 ms
+的时间常数移动，每 13 ms 一次的预算刷新之间变化只有几个百分点），只有
+**人为的大幅政策变更**才会。做这类实验时分两三步降，或接受偶发的 QP
+死亡并在分析时识别出来（症状：线上恒为 0 而预算/水位正常）。
