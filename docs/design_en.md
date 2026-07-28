@@ -1072,9 +1072,9 @@ send is genuinely small (not a TSO super-packet), and the pair's
 accumulated debt is within one burst**. The first two exclude
 throughput flows disguised as sparse; the third caps the bypass itself,
 bounding the aggregate escape even under many small flows. Placing the TCP executor on the
-host rather than the DPU is a settled architectural conclusion (the
-negative result on DPU-side TCP offload is recorded in
-`docs/archive/superseded-designs.md`).
+host rather than the DPU is a settled architectural conclusion: OVS owns
+the representor's ingress, and on this platform there is no attachment
+point that is both transparent and preserves pacing semantics.
 
 ## 6 Parameters
 
@@ -1191,13 +1191,13 @@ switch to a *weighted* response law (weights configured by the
 operator), naturally separated from the edge's synthesized marks —
 synthesized marks ride the telemetry channel, fabric signals ride
 measurement. The mechanism is laid out but not evaluated on this
-testbed (see `archive/rd_fairness_design_c.md` §4).
+testbed.
 
 **Named configuration modes.** Demand-side "share floors" (ledger
 shares never shrink, at the cost of killing temporary borrowing during
 dips) and per-class step sizes (utilization-first, at the cost of ratio
 drift) are retained as named modes for specific SLA scenarios; neither
-is default (trade-off data in `docs/archive/`).
+is default.
 
 **Known limitations.** Sub-period burst precision is not promised
 (tenant CC absorbs it); policy changes take effect at period
