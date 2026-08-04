@@ -28,7 +28,7 @@ boundaries and extensions.
 | pace | Limiting a flow-set's rate by spacing packet departures; delay only, never drop |
 | Tree share $Tree_f$ | The share the sender's local tree gives $f$, i.e. the product of sender-side uplink policy (§4.3) |
 | Work-conserving | Capacity never idles while unmet demand exists; "one class idle, the other may borrow" is this property |
-| Headroom | Deliberately allocating slightly below physical capacity (3%) so virtual queues alarm before physical ones |
+| Headroom | Deliberately allocating slightly below physical capacity so virtual queues alarm before physical ones; current deployment 8% = 3% queue-warning + ~5% VxLAN encap tax (§6) |
 | Fail-open | On control-channel failure the system degrades to "no rate limiting" rather than wedging in a limited state |
 | Control period $T$ | The beat of one measure→allocate→mark→respond loop, currently 1 ms |
 
@@ -297,7 +297,9 @@ incast (§8.3).
 ### 3.2 Allocation: three-layer water-filling
 
 **A worked example used throughout this section.** Receiver downlink
-100G, headroom 3% ⇒ ledger capacity $C' = 97$G. Two dst tenants A and
+100G, headroom taken as 3% (illustrative value for this example; the
+current deployment uses 8%, see §6 — the arithmetic is isomorphic) ⇒
+ledger capacity $C' = 97$G. Two dst tenants A and
 B, equal weights, each with $MaxRate$ = 60G. Tenant A runs both TCP
 and RDMA with class weights 1:1; tenant B runs RDMA only. Each class
 has a single sender (layer 3 degenerates; covered separately at the
@@ -617,9 +619,12 @@ all $\hat e_f$ costs $O(N\log N)$ — against $N$ full allocations
 ($O(N^2)$ or worse) for the naive route. Measured: 448 µs per pass at
 20 flow-sets (§7).
 
-**Headroom = 3%** keeps the ledger's capacity slightly below the
+**Headroom** keeps the ledger's capacity slightly below the
 physical capacity, guaranteeing that under incast the virtual queues
-alarm before the switch's physical queue does — by the time the signal
+alarm before the switch's physical queue does. The current deployment
+uses **8%**: 3% of queue-warning margin plus ~5% of VxLAN encap tax
+(the ledger accounts inner bytes while the physical port carries outer
+headers; measured 4.99% at 1500 MTU; §5.1, §6) — by the time the signal
 reaches the senders, no physical queue has formed yet.
 
 ### 3.3 Audit: virtual-queue integration
@@ -643,16 +648,23 @@ measurement spikes are absorbed by the integral (the AVQ lineage). The
 full scale $V$ is a wall-clock integral quantity (excess × time) and
 therefore **does not scale with the control period** — the same
 history of excess accrues the same debt whether it is ticked as fifty
-1 ms periods or one 50 ms period. $V$ is anchored to the **capacity of the resource being protected** —
-the same downlink bottleneck capacity $C$ the scheduler uses, recomputed
-together with it whenever the link speed changes:
+1 ms periods or one 50 ms period. $V$ is set by **reverse-solving the audit loop's target damping**
+(derivation and bounds in `design_theory.md` §3):
 
-$$V = v_{sec}\cdot \text{headroom}\cdot C, \qquad v_{sec} = 0.2\ \text{s}$$
+$$V = \frac{4\zeta^2\,\gamma\,\hat e^*}{k}$$
 
-i.e. "about 0.2 s of headroom-scale sustained excess saturates the
-mark". On this testbed $C$ = 100G (the receiver downlink is stepped
-down to 100G to create incast) ⇒ $V$ = 600 Mbit. **Anchoring to the
-bottleneck capacity rather than the NIC port line rate** matters: in
+at the typical contention working point $\hat e^*$ with the classic
+optimal damping $\zeta = 1/\sqrt2$. Current deployment: $\hat e^*$ =
+23G (four equal tenants sharing $C'$=92G) ⇒ **$V$ = 576 Mbit**
+(pinned by the 2026-07-29 discrimination experiments,
+`hpft-implementation/results/vtune_20260729/`). **$V$ is independent
+of headroom** — headroom's only job is the capacity concession; the
+registry's `v_seconds` is merely the dial that lands $V$ at this value
+through the legacy $v_{sec}\cdot$headroom$\cdot C$ packaging. When
+headroom or $C'$ changes, re-solve $V$ from the $\zeta$ rule and reset
+`v_seconds`; never let $V$ drift as a side effect. Since $\hat e^*$
+scales with the bottleneck capacity $C$, $V \propto C$: **anchoring to
+the bottleneck capacity rather than the NIC port line rate** matters: in
 the audit loop's damping $\zeta = \tfrac12\sqrt{kV/(\gamma\hat e)}$
 (§4.2), $\hat e$ scales with $C$, so $V$ must scale with it too for
 $\zeta$ to be independent of link speed; anchored to the port line
@@ -959,7 +971,16 @@ carrying one header copy, no inter-frame gap) while measurement reads
 the NIC's wire counters, the mismatch is a constant gain error in the
 loop and shows up directly as that class steadily overshooting its
 share (measured at 8%). Sensor and actuator sharing one accounting is
-the precondition for a loop without static bias. The
+the precondition for a loop without static bias. Under the VxLAN
+overlay deployment (the lab's resident form since 2026-07-29) this
+accounting shifts wholesale to **inner** wire bytes: the sensor (VF
+vport counters) and both executors naturally sit on the inner side, so
+the loop stays self-consistent; the capacity cost of the outer
+encapsulation headers never enters the per-flow accounting — it is
+folded into headroom as a one-time concession at the root capacity.
+Compensating a single executor for outer headers would instead
+recreate the cross-class accounting asymmetry (RDMA hardware pacing
+cannot charge for outer bytes). The
 tenant's congestion control keeps running underneath the pace, and the
 two loops do not excite each other: to tenant TCP the pace looks like a
 smooth pipe (the OnRamp-style argument); for RDMA, the
@@ -1098,8 +1119,8 @@ back on the ledger side). Production values (ground truth is the
 | $\gamma$ | 0.25 | audit-discount cap (target floor $(1-\gamma)\hat e_f$; damping $\zeta = \tfrac12\sqrt{kV/(\gamma\hat e_f)}$) |
 | $\delta$ | 0.15 | demand growth margin (a zero-sum tax; must stay small, §3.2) |
 | node saturation test | enter 95% / leave 85% | the backlog test's single criterion: any saturated node on the path ⇒ backlogged; hysteresis held per node (§3.2.2) |
-| headroom | 3% | ledger capacity's concession to physical capacity |
-| $V$ | $v_{sec}\cdot$headroom$\cdot C$, $v_{sec}$ = 0.2 s; $C$=100G here ⇒ 600 Mbit | mark full scale; integral clip = $V$; $C$ is the scheduler's downlink bottleneck capacity, recomputed on link-speed changes (§3.3) |
+| headroom | 8% (= 3% queue-warning + ~5% VxLAN encap tax, since the 2026-07-29 overlay-resident deployment; tax measured 4.99% at 1500 MTU) | ledger capacity's concession to physical capacity |
+| $V$ | $4\zeta^2\gamma\hat e^*/k$ at $\hat e^*$=23G, $\zeta$=1/√2 ⇒ 576 Mbit (dialed in via v_seconds=0.072; independent of headroom) | mark full scale; integral clip = $V$; re-solve from the ζ rule when $C'$/working point changes (§3.3, design_theory §3) |
 | $N_1$, $N_2$, $N_3$ | 0.25 s, 2 s, 30 s | fail-open freeze / takeover / flow-set eviction (§4.4) |
 | pace floor | 50 Mbps | numerical lower bound: keeps $u_f > 0$ (the log law's domain) and above the executor's quantization step |
 

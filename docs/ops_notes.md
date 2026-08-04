@@ -241,3 +241,194 @@ RP 里根本没有它们的预算条目。真正的原因是**启动瞬态的聚
 的时间常数移动，每 13 ms 一次的预算刷新之间变化只有几个百分点），只有
 **人为的大幅政策变更**才会。做这类实验时分两三步降，或接受偶发的 QP
 死亡并在分析时识别出来（症状：线上恒为 0 而预算/水位正常）。
+
+## overlay 常驻时代（2026-07-29，P0 spike 定案）
+
+**lab 数据面自 2026-07-29 起常驻泛化 VxLAN overlay**（用户裁决，实证
+`hpft-implementation/results/p0_overlay_20260729/summary.md`）：两台 DPU 的
+p1 直配 underlay 172.16.1.x + 遥测 10.1.9.x（第二地址）+ MTU 9000，
+ovsbr-p1 挂 4 个 representor + vxlan100，VF IP 用直连方案原样，p1 保持
+100G。hpft/plain/jakiro 三环境共用这层数据面，只切 CC/agents/DHTB
+（`lab_env.sh` 的 ensure_overlay 负责结构，`reboot_recover.sh` 负责易失
+态）。rx_agent 默认桥已改为 ovsbr-p1。registry headroom=0.08（3% 队列
+预警 + ~5% 封装税）；**V 与 headroom 解耦**（真值规则 V=4ζ²γê*/k，
+现值 576 Mbit 经 v_seconds=0.072 拨入，判别实验 vtune_20260729）。
+随之而来的硬事实：
+
+- **`options:tos=inherit` 是硬性配置**：OVS VxLAN 默认 tos=0 不复制内层
+  DSCP，`--tclass` 流量全落交换机 TC0（实测 TC0 +98.0M 帧/TC3 +0），
+  with-TC 类分队列无法成立；设 inherit 后 TC3 +65.1M/TC0 +30。ECN 折回
+  在两种设置下都完好（RFC 6040 由硬件 decap 执行，np_ecn_marked 过载下
+  +20k/+13.6k）。
+- **p1 的软件 netdev 计数器在硬件卸载下不动**（rx_bytes 恒 0），外层
+  字节一律读 `ethtool -S p1` 的 `rx_bytes_phy`。
+- **RP（doca_pcc）重启会清空设备内存里的全部流对预算**——与"杀 tx 不等于
+  解除限速"互为对偶：杀 tx 预算冻结，重启 RP 预算归零。凡依赖"停 tx
+  冻结预算"的编排，必须先让 tx 对全部目标流集合推过预算再停。
+- 拆建 overlay 后每条新路径首包付 megaflow 冷启动税（20–100ms），判净
+  仍按本文上方的真/假鉴别表。
+- 封装税实测 4.99%（65536B 消息、MTU 1500，内层 host IB 计数 vs p1
+  phy）；账本/pace 全链内层口径自洽，外层税只在 root 容量层面由
+  headroom 吸收，**不要给 TCP shaper 单独加外层补偿**（会重造
+  TCP↔RDMA 不对称——RDMA 硬件调速计不了外层）。
+
+**家族三新形态：预算陈旧应用（2026-07-30，eval 批 1 D1 实验定位）**。
+劣化不止 fail-open 一种表现：tx 已推送新预算（遥测 R=Tree=pace 全部
+正确）、rx 裁定无辜（u/e/s 正确）的情况下，PCC 设备侧把新预算搁置
+~12 秒后才一步应用（线上钉在旧 level 值）。3 遍中 1 遍复现。每实验前
+"RP 重启 + 执行守卫探针"（eval_lib.sh 的 rp_guard）能拦截 fail-open
+形态，**测不出陈旧应用形态**——涉及预算在线变更的实验（动态类）对
+>10s 的收敛长尾先怀疑此病，用"rx u 正确 + tx pace 正确 + 线上钉旧值"
+三层证据链确诊，不要误记为控制环缺陷。
+
+**Jakiro DHTB 的 hugepages 前提（2026-07-30）**：dpu2 Arm 重启（fw reset
+随行）会清掉 hugepages 预留（非持久），DHTB 先死在 EAL（"Cannot get
+hugepage information"），补 2GB 仍死在 mbuf 池（"Cannot allocate mbuf
+pool"）——**需要 ≥4GB（2048×2MB）**。`echo 2048 > /sys/kernel/mm/
+hugepages/hugepages-2048kB/nr_hugepages` 后重启 DHTB 即愈。
+
+**实验卫生新条目：CC 开关状态必须 trap 复原（2026-07-30，烧掉批 4 首轮的学费）**。
+native-None 臂用双端 host PF 的 `roce_rp/roce_np enable` 全 prio 置 0 实现
+"关 CC"，runner 未设退出复原 → 状态泄漏到后续 Jakiro 批次：DHTB 打了上亿
+CE 而 NP 装聋（np_cnp=0），30G 配额被 87G 穿透，8 个运行作废。症状极易误诊
+为"CE 在 decap 路径丢失"。**规则：凡改 CC/重传/ECN 开关的 runner 一律
+trap EXIT 复原；跨批次首个实验前把 `dcqcn.sh status` 的 enable 位列入
+核对清单。**
+
+## TCP 执行面：债务赦免与债务上限（2026-07-30，eval 修复）
+
+**症状**：BBR 租户稳定跑到 pace 的 1.22 倍（类间 56:38 vs 政策 46:46），
+而分配全程正确（u/pace 都是 11.5G），reno/cubic 无此现象。
+
+**根因（两层，缺一不可）**：①pace-shim 每次下发预算都 `make_generation()`
+换一个新 generation，BPF 侧把"换代"理解为重配置、将该流对的整形债务
+`state->next_ns` 直接重置为 `now`——于是每 ~100ms 债务被赦免一次；
+②深债流对的时间戳被盖到很远的未来，fq 先囤后成串放出，形成瞬时线速
+突发。loss 基 CC 因丢包自限看不出来，BBR 这类自带 pacing、不轻易退让的
+CC 就把赦免额度全额兑现。
+
+**修法**：generation 改为 per-pair 稳定值（仅首装或速率跳变 >25% 时换代，
+`_gen_for()`）；BPF 侧换代时只做**有界赦免**（把债务截到 `now+50ms`），
+且债务超过 50ms 上限的报文**直接丢弃**（`TC_ACT_SHOT`）而不是盖更远的
+时间戳——既给 rate-based CC 真实丢包信号，又把 fq 排队时延封顶。
+
+**顺带治好的问题**：incast 角点（TCP 流数 ≥31、RDMA 租户仅 1–2 QP 时
+RDMA 被 CE 风暴钉死）**随之消失**——1:31 点四租户从 8.2/3.0/3.0/29.5
+变成 21.9/22.5/22.3/22.7，交换机 CE 标记归零。突发源头就是上面第②层。
+反向验证：把 shim 的 burst 收紧到 32KB 反而让受害者掉回 3.1G、CE 98 万，
+**故不引入 burst 旋钮**，保持 256KB 默认。
+
+## 归属滞后守卫（2026-07-30，eval 修复）
+
+**症状**：同 dst 新发送方加入后 ~2s 内，其字节被记到在位者头上（曾观测
+单拍 46.69G 的物理不可能读数），在位者账本被打满、吃 25% 冤枉折扣，
+D3 加入方向收敛 3.5–4.0s。
+
+**修法**（`rx_agent.HybridRates`）：把"划分出错免疫"从执行面内环延伸到
+账本充入路径——**部分可见的新成员**（年龄 < mix 窗且已有字节）出现时，
+该 dst 的池子改按上一拍授予额分摊，不信尚不可信的 megaflow 比例。
+**只对新成员生效**：退出者字节为零，由既有 `unmeasured` 分支覆盖；早期
+把退出也纳入守卫会让幸存者迟迟爬不进被释放的份额。
+
+**效果与残余**：加入方向 3.5–4.0s → **0.31/0.43s**（10×）。退出方向
+仍 ~2.8s，机制不同——幸存者的 r 受 2s megaflow 窗口内退出者的陈旧字节
+稀释，属测量链延迟，非律或账本问题；根治需要更新鲜的 per-sender 数据源
+（发送端自报或 RP per-flowtag 计数），列为后续。
+
+## 发送端活性回传：归属的新鲜信号（2026-07-30）
+
+接收端把一个 dst 的精确池子分给各发送方时，比例来自 megaflow 字节计数，
+而该计数被硬件缓存约 1 秒。**发送方停发后，它的陈旧字节还能占住份额**，
+幸存者的实测速率被稀释、迟迟爬不进被释放的容量。接收端没有任何计数器
+能在 1 秒内看出这件事，但**发送方自己的 vport TX 计数是 1ms 新鲜的**。
+
+做法：发送端 DPU 也跑 `hpft-vport-meter`（同一个二进制，读本端 PF），
+`tx_agent_e` 每拍把 per-(src vnic, class) 的实发速率经 UDP 9713 发给
+接收端；`rx_agent` 只把它当**门控**用（"这个发送方还在发吗"），比例仍由
+接收端自己测。发送方停发 → 当拍从归属里消失 → 幸存者立刻拿到全部池子。
+回传缺失或过期（>0.3s）时行为与之前完全一致，基线臂不受影响。
+遥测增量约 1.7 Mbit/s。**键名坑**：payload 的 key 已是 `<vnic_id>|<class>`
+而 vnic_id 自带 host（`sgpu01/vf0`），接收端不要再拼一次 host。
+
+**效果与剩余**：同 dst 加入方向 3.7s → **0.24–0.49s**；退出方向的归属
+部分被彻底消除（B 退出当拍就从 r 里消失、目标 u 立即跳到新份额），但
+**总收敛仍约 2–2.8s，剩余全在 RDMA 执行面的上升爬坡**：发送端 pace 在
+30ms 内就到位，线上速率却按约 12.5%/步 爬。根因是 RP 把任何预算变更都
+当作"上限改变"并重置整定窗口，因此 tx 用 3% 迟滞保持预算准静态、设备
+只能靠自身积分往上爬。试过"大幅上调时连推几拍"促使设备走直接赋值分支，
+无效（且重复推送反而重置整定窗口），已撤回。**根治需要改 DPA 设备码的
+水位赋值逻辑，未做。**
+
+## RP 预算新鲜度探针（2026-07-30）
+
+`eval_lib.sh` 的 `rp_guard` 只验"执行面还在压着"，测不出"压的是不是
+新预算"——正是造成 12–24 秒收敛长尾的那个形态。新增 `rp_fresh`：跑中把
+dst 配额 20G→8G，检查线上是否跟随（<9.5G 判过）。实测通过（7.76G）。
+涉及在线改预算的实验批次建议在 `rp_guard` 之后加跑一次。
+
+## PCC 里的拥塞控制项：三选一，以及 RTT 通路的现状（2026-08-03）
+
+HyperFront 的限速（`level = budget/N`）与其下的拥塞控制是两件事，执行面
+永远是 `rate = min(cc_rate, level)`。cc_rate 现有三种实现，运行时用
+mailbox `0xccd <0|1|2>` 切换（切换会重置各流对的 CC 状态）：
+
+- **0 = AIMD**：CNP 触发固定比例乘性减 `cc_rate -= (cc_rate>>6)/nqp`，
+  每 epoch 固定步长加性增 `+= MAX>>8`。**它不是 DCQCN**——没有 α、没有
+  目标速率、没有三阶段恢复。文档与论文里必须叫它 AIMD。
+- **2 = 软件 DCQCN**：RP 状态机的忠实实现——CNP 时 `Rt=Rc`、
+  `Rc=Rc(1−α/2)`、`α+=g(1−α)`；α 定时器按 g 衰减；恢复定时器驱动
+  快恢复（F 步，`Rc=(Rt+Rc)/2`）→ 加性增（`Rt+=AI`）→ 超增（`Rt+=HAI`）。
+  三个旋钮经 mailbox `0xcce <值> <0=AI|1=HAI|2=恢复定时器us>` 可调，
+  对应固件的 rpg_ai_rate / rpg_hai_rate / rpg_time_reset。
+  **量化事实**：定时器在 epoch（1ms）边界检查，故实际周期是
+  `max(epoch, 设定值)`——设 300µs 与 3000µs 实测每 10 秒推进 12310 与
+  3712 个阶段（≈1ms 与 ≈2.7ms 周期），单调可调但不细于 epoch。
+  **初始化是必须的**：新分配的流对若不置 `Rt=MAX、α=1`，`Rc=(Rt+Rc)/2`
+  会把速率每拍折半直至归零（实测流量跑成 0 字节）。
+- **1 = ZTR-RTTCC**：厂商 RTT 基算法（NACK/CNP/RTT-超基准三档乘性减、
+  否则加性增）。阈值必须用本 fabric 实测值：设备时钟（1ns 粒度）下
+  base RTT min=3006ns、26G 负载无拥塞抖动带 3.3–5.7µs，故
+  `ZTR_BASE_RTT=7000`、`ZTR_MAX_DELAY=70000`（厂商模板默认 13µs/150µs
+  是别人 fabric 的数，在这里 4 倍偏高）。
+
+**RTT 通路成立的三个条件**（缺一则发送端 `rtt_req` 石沉大海、
+`rtt_events` 恒 0，而 CNP 一切正常——极易误诊）：
+1. `USER_PROGRAMMABLE_CC=1` 且 **`PCC_INT_EN=0`**（doca_pcc.h:72 成文；
+   `PCC_INT_*` 是交换机 INT 遥测那套的开关，开了反而封死 CCMAD 应答）。
+   当前双端另配了 `PCC_NP_HANDLE_CORE_UTIL=3`/`PCC_HANDLE_CORE_UTIL=3`
+   （工作配置的一部分，单独必要性未拆开验证）。
+2. RP 启动**不带 `--remote-sw-handler`**。带上它=声明"应答由对端 NP
+   软件进程处理"，对端没有 NP 进程时探针被静默丢弃；不带时由**对端网卡
+   固件硬件应答**，无需对端跑任何 PCC 进程。这是 rp_service.sh 里的一行
+   之差，曾让 RTT 断了整个战役周期。
+3. 正常数据流在跑（探针从流对的事件路径发起）。
+验证手感：`0xdec` 的 w9=rtt_req_n 与 w10=rtt_n 应同步增长（实测应答率
+99.98%）；overlay 封装不妨碍 CCMAD（固件流量走端口层，tcpdump 对其
+不可见——抓不到包不代表没发）。
+
+**构建与部署提醒**：设备码改完必须 `meson setup --reconfigure build`
+再 `ninja`（dpacc 在 configure 步）；host 侧编译的是
+`pcc/host/pcc.c`（仓库副本名为 `pcc_host.c`，改完要 scp 成 `pcc.c`），
+只改 host 时 `ninja` 即可。DPU 上的活树是 `~/bzx/doca34-apps`。诊断探针：
+`0xdeb <pair>` 回读 {flowtag,budget,level,remote_rx,r_units,cc_rate,
+epochs,cap,α,Rt,stage}，`0xdec <pair>` 回读 {cnp_any,cnp_hits,qp_count,
+cc_rate,dbg_hits,flowtag,rtt_last,rtt_min,rtt_events,rtt_req_n,rtt_n}。
+
+## fw reset 后的僵死病：vport_meter 与一切 DEVX 常驻进程（2026-08-03）
+
+`vport_meter` 持有 DEVX 上下文常驻采样。**fw reset 杀死上下文但不杀进程**：
+进程还在、systemd 显示 active、共享内存却永远停更——下游 rx_agent 测不到
+任何速率，political budget 全部 fail-open 成 MaxRate，限速名存实亡，而一切
+流量图看起来"还行"（devlink 顶+对称结构给出貌似合理的份额）。极难察觉。
+
+- 判活不能看进程/unit 状态，也不能看 mmap 文件 mtime（mmap 写不更新
+  mtime）——要跑一条流看 rx_agent jsonl 的 `r` 字段是否非空。
+- 恢复链（reboot_recover.sh）现已无条件 `systemctl restart
+  hpft-vport-meter`；实验 runner 的 rp_guard 失败路径也会踢它。
+- 同族风险：任何 fw reset 后，所有持有设备上下文的常驻进程
+  （vport_meter、doca_pcc、依赖 devx/mlx5dv 的自定义采样器）一律主动重启，
+  不要相信"进程还活着"。
+
+同日另一个恢复链缺口：`hpft-qpn-resolver`（host 侧,喂 {qpn->pair} 给 RP,
+决定 level=budget/N 的 N）不在任何恢复链里,fw reset 后长期缺位 → 多 QP
+流对 N=1,level 放大 4 倍。已加入 cc_mode.sh pcc 路径与 status 行。
