@@ -432,3 +432,38 @@ cc_rate,dbg_hits,flowtag,rtt_last,rtt_min,rtt_events,rtt_req_n,rtt_n}。
 同日另一个恢复链缺口：`hpft-qpn-resolver`（host 侧,喂 {qpn->pair} 给 RP,
 决定 level=budget/N 的 N）不在任何恢复链里,fw reset 后长期缺位 → 多 QP
 流对 N=1,level 放大 4 倍。已加入 cc_mode.sh pcc 路径与 status 行。
+
+## VF MTU 是 RoCE 的生死开关（2026-08-13/14，一整天的学费）
+
+**症状**：RoCE QP 握手成功、数据 WQE 全部 CQE flush error、字节不出
+VF vport；同路径 ICMP/TCP 完全正常；双向皆断。极具迷惑性——像 eswitch/
+对端/交换机故障，实际与它们全部无关。
+
+**根因**：VF MTU=8192 时 RoCE path MTU 协商为 4096，4KB 数据帧死在
+VXLAN encap 路径（1500 下 path MTU 1024，一切正常）。握手包小，照常
+通过，所以"能建连不能传数据"。**vf_setup.sh 曾显式设 8192**——用它
+重建 VF 而不跟 cc_mode post_recover（强制 1500）就中招。已改源头
+（两台 host 的 vf_setup.sh 均为 mtu 1500）。
+
+**判据**：遇到"RoCE 建连成功但零吞吐+CQE error"，先查
+`ip link show <vf> | grep mtu`，再做任何重启。当天为此白做了两台 Arm
+重启、双端 synced fw reset、两台 host 重启、两侧 mlx5_ib 重载。
+
+## Arm 重启的连锁僵尸（同日，第二课）
+
+Arm OS 重启清掉 hugepages（sysctl 非持久）→ OVS-DOCA/DPDK 组件
+（vswitchd doca-init、jakiro_dhtb）拉不起或行为退化。已在两台 DPU 写
+`/etc/sysctl.d/99-hpft-hugepages.conf`（nr_hugepages=2048）持久化。
+同族已知项：/tmp 清空（vpm_sample.py、rp_service.sh 要重新 scp）、
+ROCE_ACCL 寄存器归零、p1 速率回 200G、ethtool pause 复位。
+
+## jakiro DHTB 的两条部署纪律（同日，第三课）
+
+1. **冷启动概率性不转发**：同一 conf 同一序列，有的实例正常、有的把
+   TCP/RoCE 全黑洞而 ICMP 照过（ICMP 不在它的分类器里）。ping 判活
+   无效；唯一可信的就绪门 = 起 server 后打一条真 TCP 流过树看吞吐。
+2. **每 run 重启 DHTB 的纪律与 1 冲突**——重启一次就重掷一次硬币。
+   现行做法：**单实例战役**——起一次、TCP 探测验证转发后连跑全部
+   run（令牌桶秒级回稳，跨 run 状态影响可忽略）。
+3. 顺带：探针/gate 复用 iperf3 server 会踩"单 test 服务"陷阱（timeout
+   掐死的客户端让 server 卡住，其后探测全零）——每次探测前 kill 重起。
