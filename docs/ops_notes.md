@@ -494,3 +494,17 @@ ROCE_ACCL 寄存器归零、p1 速率回 200G、ethtool pause 复位。
 同日多轮重启后的其他既定病：ARP 纪律（arp_ignore）随 VF 重建丢失
 导致数据面塌缩到单 VF（详见 8-15 归因调试）；vf_setup 之后必须跟
 cross_pair_net apply。
+
+## host 重启后 TCP 执行面"看似健康实则裸跑"（2026-08-15）
+
+症状：控制律 u/R/pace 全对（tx 日志 11.25G）、shim 写 pair_cfg 全对
+（map 里 11.25G）、BPF 程序挂载在位、fq 在收包——TCP 却跑 20G+ 不受
+限。根因：`tcp-shaper-apply` 把 tc 命令排在 map 填充之前，在 host 上
+不存在的 p1 egress 步骤崩溃退出，**辅助 map（ip_to_vnic / pair_state /
+ifindex_to_vnic）全空**，BPF 每包在 `if (!cfg || !state) return TC_ACT_OK`
+放行。判据：`bpftool map dump pinned .../hpft_pair_state` 为空即中招。
+修复：`tools/host/edt_maps_ensure.sh`（已挂进 reboot_recover）。
+
+同日两个小坑：sgpu01 重启丢 `tcp_bbr` 模块（矩阵实验 BBR 格 TCP 全零；
+已加 modules-load.d + 恢复链 modprobe）；新内核 5.15.0-187 无对应
+bpftool 包，用 `/usr/lib/linux-tools-5.15.0-185/bpftool`（HPFT_BPFTOOL）。
