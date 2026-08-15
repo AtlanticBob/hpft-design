@@ -93,32 +93,10 @@ pause 原为开启（等于把最后一跳无损化），2026-07-09 已关闭。
 
 ## 压测战役追加病历（2026-07-11 晚）
 
-**p1 变速的暂态延迟病。** 反复 ethtool 变速（200↔100↔25G）后，全
-fabric 路径（VF 与 SF 皆然）出现空载 RTT 尖峰 10-200ms（正常 0.1ms），
-两端 OVS 重启与定速重训均无效，约 1 小时后自行消退。期间带内遥测尖峰
-超过 fail-open 阈值造成间歇性控制面失守。规则：变速类实验尽量减少翻转
-次数，相邻实验之间用 `ping -c 100 -i 0.05` 验证 fabric 干净再开跑。
-
-**⚠ 别把 megaflow 冷启动税误判成这个病（2026-07-24，白等 7.5 小时的教训）。**
-间歇探测（或拓扑刚建好）时，OVS 的 megaflow 表项空闲被逐出，每一轮的
-**首包**走 DPU 慢路径 20-100ms，热路径立刻回落 0.04ms——这不是变速病，
-不用等，一预热就没。当时判净标准误取了"含冷启动的 ping max"，于是永远
-达不到、白等自愈。**鉴别方法（真病 vs 假李鬼）：**
-
-| | 真·变速病 | 假·megaflow 冷启动税 |
-|---|---|---|
-| 触发 | 反复变速后 | 任何间歇探测、拓扑刚建好 |
-| 表现 | **连续** ping 也持续尖峰 | 只有**首包**慢，热路径立刻 0.04ms |
-| 自愈 | ~1 小时 | 不用等，一预热就没 |
-| 判据 | `ping -c 100 -i 0.05` 的 **avg** 仍高 | avg 干净，只有 max 高 |
-
-**规则终版（2026-08-15）：空载 ping 延迟不作为开跑门槛，只用来判
-连通性（四对 + 跨子网能否 ping 通）。** motiv 全量重做（1.1 的 28 点、
-1.2 的 30 点、1.3 的 30 run）与 eval 补格全部在 avg 0.5–1.8ms 的"病态"
-读数下直接开跑，无一例外与直连版数据逐位对齐——原因是实验都是满载
-60s 稳态测量，流量一起 megaflow 热路径即建立，稳态窗完全落在热路径
-上；空载探针的抖动是探针的性质，不是数据面的性质。上一版"avg 也高就
-等 1 小时"的规则作废，别再等。
+**空载 ping 延迟只用来判连通性，不作为开跑门槛。** 实验前用
+`ping -c 2` 确认四对 VF 与跨子网路径能通即开跑；空载探针的 RTT 数值
+（含冷启动首包、变速后的暂态抖动）与满载稳态测量无关——流量一起
+megaflow 热路径即建立，稳态窗完全落在热路径上。
 
 **SF bounce 会掉 IP；OVS 重启会掉分类规则。** `ip link set enp3s0f1s0
 down/up` 抹掉其上的 10.1.9.x 地址（带内遥测双端全断）；OVS 重启抹掉
@@ -290,10 +268,9 @@ hugepage information"），补 2GB 仍死在 mbuf 池（"Cannot allocate mbuf
 pool"）——**需要 ≥4GB（2048×2MB）**。`echo 2048 > /sys/kernel/mm/
 hugepages/hugepages-2048kB/nr_hugepages` 后重启 DHTB 即愈。
 
-**实验卫生新条目：CC 开关状态必须 trap 复原（2026-07-30，烧掉批 4 首轮的学费）**。
-native-None 臂用双端 host PF 的 `roce_rp/roce_np enable` 全 prio 置 0 实现
-"关 CC"，runner 未设退出复原 → 状态泄漏到后续 Jakiro 批次：DHTB 打了上亿
-CE 而 NP 装聋（np_cnp=0），30G 配额被 87G 穿透，8 个运行作废。症状极易误诊
+**CC 开关状态必须 trap 复原。** native-None 臂用双端 host PF 的
+`roce_rp/roce_np enable` 全 prio 置 0 实现"关 CC"；这个状态若泄漏到
+后续批次，DHTB 打 CE 而 NP 装聋（np_cnp=0）、配额被穿透，症状极易误诊
 为"CE 在 decap 路径丢失"。**规则：凡改 CC/重传/ECN 开关的 runner 一律
 trap EXIT 复原；跨批次首个实验前把 `dcqcn.sh status` 的 enable 位列入
 核对清单。**
@@ -432,27 +409,20 @@ cc_rate,dbg_hits,flowtag,rtt_last,rtt_min,rtt_events,rtt_req_n,rtt_n}。
   （vport_meter、doca_pcc、依赖 devx/mlx5dv 的自定义采样器）一律主动重启，
   不要相信"进程还活着"。
 
-同日另一个恢复链缺口：`hpft-qpn-resolver`（host 侧,喂 {qpn->pair} 给 RP,
-决定 level=budget/N 的 N）不在任何恢复链里,fw reset 后长期缺位 → 多 QP
-流对 N=1,level 放大 4 倍。已加入 cc_mode.sh pcc 路径与 status 行。
+`hpft-qpn-resolver`（host 侧，喂 {qpn→pair} 给 RP，决定 level=budget/N
+的 N）属于恢复链必备组件（cc_mode.sh pcc 路径拉起，status 行可见）；
+缺位时多 QP 流对 N=1，level 放大 N 倍。
 
-## VF MTU 是 RoCE 的生死开关（2026-08-13/14，一整天的学费）
+## VF MTU 必须是 1500（RoCE over VxLAN 的硬约束）
 
-**症状**：RoCE QP 握手成功、数据 WQE 全部 CQE flush error、字节不出
-VF vport；同路径 ICMP/TCP 完全正常；双向皆断。极具迷惑性——像 eswitch/
-对端/交换机故障，实际与它们全部无关。
+VF MTU=8192 时 RoCE path MTU 协商为 4096，4KB 数据帧过不了 VXLAN
+encap 路径；握手包小照常通过，表现为"QP 建连成功、数据 WQE 全部 CQE
+flush error、字节不出 VF vport，同路径 ICMP/TCP 正常，双向皆断"。
+两台 host 的 vf_setup.sh 均固定 mtu 1500，cc_mode post_recover 也强制
+1500。**判据**：遇到"RoCE 建连成功但零吞吐+CQE error"，先查
+`ip link show <vf> | grep mtu`，再考虑其他。
 
-**根因**：VF MTU=8192 时 RoCE path MTU 协商为 4096，4KB 数据帧死在
-VXLAN encap 路径（1500 下 path MTU 1024，一切正常）。握手包小，照常
-通过，所以"能建连不能传数据"。**vf_setup.sh 曾显式设 8192**——用它
-重建 VF 而不跟 cc_mode post_recover（强制 1500）就中招。已改源头
-（两台 host 的 vf_setup.sh 均为 mtu 1500）。
-
-**判据**：遇到"RoCE 建连成功但零吞吐+CQE error"，先查
-`ip link show <vf> | grep mtu`，再做任何重启。当天为此白做了两台 Arm
-重启、双端 synced fw reset、两台 host 重启、两侧 mlx5_ib 重载。
-
-## Arm 重启的连锁僵尸（同日，第二课）
+## Arm 重启后必须重设的易失状态
 
 Arm OS 重启清掉 hugepages（sysctl 非持久）→ OVS-DOCA/DPDK 组件
 （vswitchd doca-init、jakiro_dhtb）拉不起或行为退化。已在两台 DPU 写
@@ -460,7 +430,7 @@ Arm OS 重启清掉 hugepages（sysctl 非持久）→ OVS-DOCA/DPDK 组件
 同族已知项：/tmp 清空（vpm_sample.py、rp_service.sh 要重新 scp）、
 ROCE_ACCL 寄存器归零、p1 速率回 200G、ethtool pause 复位。
 
-## jakiro DHTB 的两条部署纪律（同日，第三课）
+## jakiro DHTB 的部署纪律
 
 1. **冷启动概率性不转发**：同一 conf 同一序列，有的实例正常、有的把
    TCP/RoCE 全黑洞而 ICMP 照过（ICMP 不在它的分类器里）。ping 判活
@@ -471,32 +441,28 @@ ROCE_ACCL 寄存器归零、p1 速率回 200G、ethtool pause 复位。
 3. 顺带：探针/gate 复用 iperf3 server 会踩"单 test 服务"陷阱（timeout
    掐死的客户端让 server 卡住，其后探测全零）——每次探测前 kill 重起。
 
-## CC 兜底项的真实咬合史与 CNP 命中率（2026-08-15 凌晨定案）
+## CC 兜底项的执行语义（rate = min(cc_rate, level)）
 
-执行面 rate = min(cc_rate, level) 里的 cc_rate 兜底，其真实行为由
-**CNP 能否命中流对表**决定，而这一点在战役中翻转过一次：
+level 是控制律（对数跟踪律 → budget/N）的执行；cc_rate 是独立于控制
+律的 CC 兜底项，行为由 **CNP 能否命中流对表**决定：
 
-- **8-03 之前（全部 17 个有效 eval 格的时代）**：CNP 反向包的 flowtag
-  与数据向不同、QP 哈希表无人喂（qpn_resolver 缺位）——CNP 命中率
-  实测 0.3%（cnp_hits=55 vs cnp_any=18522）。**兜底项形同虚设，
-  rate ≡ level，即纯对数跟踪律**。"cc_rate 弱 DCQCN 兜底形同虚设"
-  旧结论的机制根源就是命中率，不是算法温和。
-- **8-14 修好 qpn_resolver 之后**：CNP 命中率 ~100%，兜底火力放大
-  300 倍。叠加两个环境因子——接收端 min_time_between_cnps 在 VF
-  重建后变成 4µs（CNP 率 29 万/s）、恢复侧（AIMD 的 AI/DCQCN 的
-  定时器）都由 TX 事件驱动——形成**自锁陷阱**：cc 一旦被打穿到地板，
-  流量归零→TX 事件消失→恢复停摆→永锁（实测 epoch 率 43/s
-  vs 名义 1000/s）。AIMD/软件 DCQCN 全数被打穿。
-- **与已验格同语义的补格方案**：设备码给 CNP MD 加了 freeze 门
-  （与 AI 侧对称），`0xccc 1048576 0` = cc 钉 MAX = rate 纯 level。
-  expM 补格用它；expD（要扫活的 CC）在当前全命中环境下不存在
-  "咬而不崩"的中间态，档位扫描需重新设计，留设计侧裁决。
-- 遥留问题（设计侧）：恢复路径是否应改为时钟驱动；兜底剂量如何
-  随命中率标定。
+- **命中率由 qpn_resolver 决定**。它不在位时 CNP 反向包对不上流对
+  （命中率 ~0.3%），兜底项形同虚设，rate ≡ level（纯控制律）；它在位
+  时命中率 ~100%。
+- **全命中 + 当前 CNP 密度下兜底项会自锁**：接收端 min_time_between_cnps
+  为 4µs 时 CNP ~29 万/s，AIMD 与软件 DCQCN 都被打穿到地板；恢复侧
+  （AIMD 的 AI、DCQCN 的定时器）由 TX 事件驱动，流量归零后恢复停摆
+  （实测 epoch 率 43/s vs 名义 1000/s），永锁。
+- **eval 格的统一执行语义 = 兜底钉 MAX**：`0xccc 1048576 0`（freeze 门
+  同时盖住 MD 与 AI 侧）→ rate ≡ level。2-1-2 全部 HyperFront 格在
+  此语义下验收。
+- **设计侧待议**：兜底剂量如何随命中率标定；恢复是否改为时钟驱动。
+  在裁决前，任何需要"活的兜底项"的实验（如 expD HyperFront 档位臂）
+  不存在"咬而不崩"的中间态。
 
-同日多轮重启后的其他既定病：ARP 纪律（arp_ignore）随 VF 重建丢失
-导致数据面塌缩到单 VF（详见 8-15 归因调试）；vf_setup 之后必须跟
-cross_pair_net apply。
+VF 重建之后必须跟 `cross_pair_net.sh apply`（两端）：arp_ignore/
+rp_filter 是 per-netdev 状态，随 VF 一起消失；缺失时四个 VF 抢答
+彼此的 ARP，数据面塌缩到单 VF，rx 归因忠实报出全部流集落在 vf0。
 
 ## host 重启后 TCP 执行面"看似健康实则裸跑"（2026-08-15）
 
@@ -508,6 +474,7 @@ ifindex_to_vnic）全空**，BPF 每包在 `if (!cfg || !state) return TC_ACT_OK
 放行。判据：`bpftool map dump pinned .../hpft_pair_state` 为空即中招。
 修复：`tools/host/edt_maps_ensure.sh`（已挂进 reboot_recover）。
 
-同日两个小坑：sgpu01 重启丢 `tcp_bbr` 模块（矩阵实验 BBR 格 TCP 全零；
-已加 modules-load.d + 恢复链 modprobe）；新内核 5.15.0-187 无对应
-bpftool 包，用 `/usr/lib/linux-tools-5.15.0-185/bpftool`（HPFT_BPFTOOL）。
+相关固定事实：`tcp_bbr` 需显式加载（modules-load.d + 恢复链 modprobe，
+CC 矩阵实验的 BBR 格依赖它）；bpftool 用
+`/usr/lib/linux-tools-5.15.0-185/bpftool`（HPFT_BPFTOOL，内核 5.15.0-187
+无对应包）。
