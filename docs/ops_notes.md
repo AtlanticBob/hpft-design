@@ -467,3 +467,30 @@ ROCE_ACCL 寄存器归零、p1 速率回 200G、ethtool pause 复位。
    run（令牌桶秒级回稳，跨 run 状态影响可忽略）。
 3. 顺带：探针/gate 复用 iperf3 server 会踩"单 test 服务"陷阱（timeout
    掐死的客户端让 server 卡住，其后探测全零）——每次探测前 kill 重起。
+
+## CC 兜底项的真实咬合史与 CNP 命中率（2026-08-15 凌晨定案）
+
+执行面 rate = min(cc_rate, level) 里的 cc_rate 兜底，其真实行为由
+**CNP 能否命中流对表**决定，而这一点在战役中翻转过一次：
+
+- **8-03 之前（全部 17 个有效 eval 格的时代）**：CNP 反向包的 flowtag
+  与数据向不同、QP 哈希表无人喂（qpn_resolver 缺位）——CNP 命中率
+  实测 0.3%（cnp_hits=55 vs cnp_any=18522）。**兜底项形同虚设，
+  rate ≡ level，即纯对数跟踪律**。"cc_rate 弱 DCQCN 兜底形同虚设"
+  旧结论的机制根源就是命中率，不是算法温和。
+- **8-14 修好 qpn_resolver 之后**：CNP 命中率 ~100%，兜底火力放大
+  300 倍。叠加两个环境因子——接收端 min_time_between_cnps 在 VF
+  重建后变成 4µs（CNP 率 29 万/s）、恢复侧（AIMD 的 AI/DCQCN 的
+  定时器）都由 TX 事件驱动——形成**自锁陷阱**：cc 一旦被打穿到地板，
+  流量归零→TX 事件消失→恢复停摆→永锁（实测 epoch 率 43/s
+  vs 名义 1000/s）。AIMD/软件 DCQCN 全数被打穿。
+- **与已验格同语义的补格方案**：设备码给 CNP MD 加了 freeze 门
+  （与 AI 侧对称），`0xccc 1048576 0` = cc 钉 MAX = rate 纯 level。
+  expM 补格用它；expD（要扫活的 CC）在当前全命中环境下不存在
+  "咬而不崩"的中间态，档位扫描需重新设计，留设计侧裁决。
+- 遥留问题（设计侧）：恢复路径是否应改为时钟驱动；兜底剂量如何
+  随命中率标定。
+
+同日多轮重启后的其他既定病：ARP 纪律（arp_ignore）随 VF 重建丢失
+导致数据面塌缩到单 VF（详见 8-15 归因调试）；vf_setup 之后必须跟
+cross_pair_net apply。
