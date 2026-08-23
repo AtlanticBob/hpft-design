@@ -1,9 +1,12 @@
-# CC 模式切换教程：非 PCC DCQCN ↔ PCC+HPFT、GBN ↔ SR（2026-07-15）
+# CC 模式切换：非 PCC DCQCN ↔ PCC+HPFT、GBN ↔ SR
 
-这份文档配合 `tools/cc_mode.sh` 使用，把 motivation 实验期间摸清的固件
-行为固化下来，让后续实验不再踩坑。**从 2026-07-15 起，lab 的默认停留态
-是"非 PCC 固件 DCQCN + GBN"**（motivation 实验基线）；PCC+HPFT 只在明确
-需要时用 `cc_mode.sh pcc` 拉起，实验后不再自动恢复。
+这份文档配合 `tools/cc_mode.sh` 使用，把固件在这几种模式下的行为固化下来。
+lab 当前停在哪一套用 `cc_mode.sh status` 或 `lab_env.sh status` 看，不要假定。
+
+**下面命令里的 PCI 地址是 sgpu01/sgpu02 的卡（`0000:38:00.x`）；sgpu03/sgpu04
+用的是 `0000:b8:00.x`。** `cc_mode.sh` 与 `activate-fw.sh` 都从
+`config/lab-tcp-registry.json` 的 `pf_bdf` 读本机地址，手工敲命令时才需要自己
+换。
 
 ## 三个必须知道的固件事实
 
