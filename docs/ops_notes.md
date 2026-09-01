@@ -4,7 +4,7 @@
 "每一层都报健康、数据却是错的"的事故，但事故经过不在这里，在 git 里。
 
 按需要它的时机组织：开跑之前 → 改东西的时候 → 平台的硬约束 → 症状速查。
-系统本身怎么工作看 `design.md`，lab 长什么样和怎么跑一场实验看
+系统本身怎么工作看 `design_v4.md`（为什么稳、换规模怎么调参看 `design_theory_v4.md`），lab 长什么样和怎么跑一场实验看
 `hpft-implementation/README.md`。
 
 ## 开跑之前
@@ -16,7 +16,7 @@
 **每场实验重启一次 RP。** 执行面会跨实验失去限速能力：预算照收、`0xdeb`
 回读的 level 照样正确，就是不作用到线上。同一家族还有第二种形态——设备侧把
 新预算搁置约 12 秒才一步应用（3 遍中 1 遍复现），线上钉在旧 level 上，而 rx
-的裁定与 tx 的 pace 三层证据都正确。`roles.sh set` / `incast8_regression.sh` /
+的裁定与 tx 的 pace 三层证据都正确。`roles.sh set` / `validation/run/run.sh` /
 `cc_mode.sh pcc` 都已内建；手工起流之前自己补一次。涉及在线改预算的实验，
 对 >10s 的收敛长尾先怀疑陈旧应用形态，别记成控制环缺陷。
 
@@ -26,8 +26,11 @@ RDMA 每条 ~27G、合计 216G 灌进 100G 下行，RC 重传风暴会打死其�
 像"某些流对坏了"。做法：给 perftest 加 `--rate_limit`（硬件档位，只接受
 2.5/5/10 这类离散值），或者让被测系统在流量起来之前就把限速下发下去。
 **不要指望控制环"一两个周期内收敛"兜住启动瞬态**：那两个周期里 QP 已经死了。
-HPFT 的新流集合以 $R=Tree_f$ 乐观起步，$N$ 条同时起步聚合是 $N\times Tree_f$，
-所以多对 RDMA 的 runner 要么错开启动、要么加 `--rate_limit`。
+设计 v4 起，新流集合的**围栏**从地板起步（不再是 $Tree_f$），但真正决定启动
+瞬态的是**执行面给未知流的额度**：RDMA 执行面在第一份预算到达之前按每 QP
+`rdma_unknown_rate_bps`（现 5 G）放行，所以一个 4 QP 的流集合起步就是 20 G，
+$N$ 条同时起步聚合是 $N$ 倍。多对 RDMA 的 runner 要么错开启动、要么加
+`--rate_limit`。
 
 **不要一步大幅降速。** 单对 RDMA 在 cap 20G→1G 的**一步 20 倍**政策降幅下，
 3 次里有 1 次线上归零且不再恢复。危险的是**降幅本身**而非终点速率——稳态低速率
@@ -44,7 +47,7 @@ HPFT 的新流集合以 $R=Tree_f$ 乐观起步，$N$ 条同时起步聚合是 $
 流量会污染测量；实验后恢复。
 
 **一次只跑一场。** 两场重叠时后一场的角色重启会打断前一场，而前一场仍会写出
-一整套看起来完整的产物。`incast8_regression.sh` 用 `/tmp/hpft_run.lock` 互斥。
+一整套看起来完整的产物。`validation/run/run.sh` 用 `/tmp/hpft_run.lock` 互斥。
 
 ## 改东西的时候
 
@@ -141,7 +144,27 @@ ROCE_ACCL 寄存器（SR 开关）是易失的，fw reset 后归零，`cc_mode.s
 `rx_agent` 与恢复链幂等重装。
 
 **devlink 限速可用**（fw 32.49.1014 实测：带载设置、翻转、解除共 14 次全部干净，
-10G 档实测 9.78G）。它是 VM 级 MaxRate 的硬件兜底。
+10G 档实测 9.78G）。它是 VM 级 MaxRate 的硬件兜底。 **入参是 bit/s，JSON 读回是
+byte/s**，差 8 倍——两边单位不同这件事没有任何报错，`hw_maxrate_test.py` 专门守它。
+**它只有 `tx_share`/`tx_max`，没有任何接收方向的参数**，所以接收端的下行上限做不成
+devlink，只能是 OVS meter（见下）。
+
+**接收端的 OVS meter 会周期性地把新流发现拖慢五倍。** 每 VF 50 G 的下行上限用的是
+OVS drop meter，而这套 OVS（`doca-openvswitch 3.4.0040`，内核数据面 + `hw-offload`）
+在卸载带 police 动作的流时会持续报 `tc|ERR|Failed to parse police action options`，
+有流量时约每秒 19–20 条。三对三对照：meter 在时接收端接纳新流集合要 1111/1101/229 ms，
+撤掉 meter 后收敛到 257/153/268 ms，police 错误 60/60/60 → 0/0/0。它不是让接纳整体
+变慢，而是**让它偶发地卡住四到五倍**——同一配置下 153 ms 到 1169 ms 的巨大散布就是
+这么来的。已试且无效的两条：显式调 meter 的 burst（`3063225600b` → `93132000b`，
+错误数不变），换 OVS 版本（仓库里没有别的版本）。撤 meter 不是方案（那个上限有用途）。
+真要根治得把下行限速挪出 DPU 的 OVS。**注意 `dpif_flow_put_error` 约 43% 的安装失败
+率不是 meter 造成的**（撤掉后仍在），那是另一个没查的问题。
+
+**RP 邮箱有快慢两态。** `doca_pcc_mailbox_send` 的耗时在 **13.3 ms 与 21.9 ms** 之间
+切换，每台 DPU 约三分之一时间在快态，各台周期不同且相位不同，跨 doca_pcc 重启存活；
+切换时机器的负载、中断率、上下文切换、温度都没有阶跃，原因未查明。已验证**对稳态没有
+可测影响**，所以不必为它排队等窗口；`validation/run/run.sh` 把每次运行各发送端的实测
+值记进 `results/<tag>/mailbox_mode.txt`，比较收敛时按模式分组即可。
 
 ## perftest 的坑
 
@@ -152,19 +175,35 @@ ROCE_ACCL 寄存器（SR 开关）是易失的，fw reset 后归零，`cc_mode.s
 - **交叉对必须走非 CM 路径**（`-x <gid>`，不能用 `-R`）：用 rdma_cm 时内核按目的
   子网先选路，源 VF 是拥有那个子网的那个，`-d` 说了不算，流量实际是直连对。
 
+## iperf3 的坑
+
+- **`--start-at <unix time>` 存在，但不在 `--help` 里。** 这是本地补丁（源码在
+  `~/hyperfront/iperf320`，四台已装 `/usr/local/lib/libiperf.so.0`），只加了选项与
+  解析、没加帮助文本。**别用 `--help` 判断它在不在**——查
+  `strings /usr/local/lib/libiperf.so.0 | grep start-at`。没有它，TCP 的首字节比名义
+  时刻晚 0.5–1.1 s（建链加参数交换），而收敛是从名义时刻起算的，这一秒会被记在系统
+  头上。选项解析在**库**里，所以只换 `iperf3` 二进制不换 `libiperf` 是无效的。
+- 多 VF 并发一律 `%dev` 强绑定，见上面"平台硬约束"那条。
+
 ## PCC 执行面
 
 **限速与拥塞控制是两件事。** `level` 是控制律的执行（budget/N）；`cc_rate` 是租户
-自己的 CC。执行面**只读 cc_rate、不改它**：把它的下降累积成一个相对政策份额的偏离
-$d$，自己把 $d$ 收回 1，下发 $rate=d\cdot level$。被自己的整形卡住时（实发 ≈ 已
-下发）那次降速不计入。取小值的旧组合 `min(cc_rate, level)` 作为对照臂保留
-（`0xcca 0`）。
+自己的 CC。执行面**只读 cc_rate、不改它**。设计 v4 起下发的是**限幅**：
+$rate=\operatorname{clip}(cc,\ (1-T)\cdot level,\ level)$——上界恒等于 level（与
+信任度无关），下界随执行面自有的信任度 $T$ 放开。落在区间内时 $cc$ 一字不改，
+所以行为正常的 CC 看不见我们。设备端由 `0xb47d` 批量格式启用（每条目多带一个
+信任度字），走 `trust_mode` 分支。
+
+两条对照臂仍在设备码里：`0xcca 1` 是旧的观测耦合 $rate=d\cdot level$，`0xcca 0`
+是基线 `min(cc_rate, level)`。**注意设备码里 `trust_mode` 字段旁的注释写着
+`rate = T*cc + (1-T)*level`，那是加权平均，不是现在的实现**——加权平均会向上漏
+（信任度 12% 就能漏出 24 G，实测），设计 v4 明确否掉了它。
 
 **`level = budget/N` 里的 N 来自 `qpn_resolver`。** 它不在位时 RP 对不上 CNP 与
 流对（命中率 ~0.3%），而且多 QP 流对的 N=1，**每个 QP 都拿整份预算**——n 个 QP 的
 流会跑到 n 倍份额，而账本、律、邮箱三层读数全部正确。它是发送端必备组件。
 
-**cc_rate 三选一**，mailbox `0xccd <0|1|2>` 切换（切换会重置各流对 CC 状态）：
+**cc_rate 四选一**，mailbox `0xccd <0|1|2|3>` 切换（切换会重置各流对 CC 状态）：
 
 - **0 = AIMD**：CNP 触发固定比例乘性减、每 epoch 固定步长加性增。**它不是 DCQCN**
   ——没有 α、没有目标速率、没有三阶段恢复，文档与论文里必须叫它 AIMD。
@@ -176,6 +215,9 @@ $d$，自己把 $d$ 收回 1，下发 $rate=d\cdot level$。被自己的整形�
 - **1 = ZTR-RTTCC**：厂商 RTT 基算法。阈值必须用本 fabric 实测值——设备时钟下
   base RTT min=3006ns、26G 负载无拥塞抖动带 3.3–5.7µs，故 `ZTR_BASE_RTT=7000`、
   `ZTR_MAX_DELAY=70000`（厂商模板默认的 13µs/150µs 是别人 fabric 的数）。
+- **3 = Swift**：时延基，阈值同样要本 fabric 校准（base 6µs / fs_range 20µs，
+  校准见 `results/swift_20260827/summary.md`）。它是 V6"换一种 CC"场景的被测臂；
+  motivation 用的是独立的 `pcc_swift_stock`，不是这一项。
 
 **RTT 通路成立的三个条件**，缺一则 `rtt_req` 石沉大海、`rtt_events` 恒 0 而 CNP
 一切正常（极易误诊）：
@@ -189,10 +231,18 @@ $d$，自己把 $d$ 收回 1，下发 $rate=d\cdot level$。被自己的整形�
 验证：`0xdec` 的 w9=rtt_req_n 与 w10=rtt_n 应同步增长（实测应答率 99.98%）。
 overlay 封装不妨碍 CCMAD，固件流量走端口层，**tcpdump 抓不到不代表没发**。
 
-**已知的收敛长尾：RDMA 执行面的上升爬坡。** 发送端 pace 在 30ms 内就到位，
-线上速率却按约 12.5%/步 往上爬——RP 把任何预算变更都当作"上限改变"并重置整定窗口。
-测同 dst 的加入/退出收敛时，归属侧已降到 0.24–0.49s，**剩余的约 2–2.8s 全在这段
-爬坡**，不要记成控制环或账本的问题。根治要改 DPA 设备码的水位赋值逻辑，未做。
+**执行面的上升爬坡已经没有了**（2026-08-31 起）。设备码曾用积分搜索水位，把每次
+预算变更都当作"上限改变"重置整定窗口，线上按约 12.5%/步 爬升，给加入/退出收敛
+额外加 2–2.8 秒。现在 `level` 是**一步赋值** `budget/N`，$N$ 从事件流里数。受控
+阶跃实测：命令写进 FIFO 到接收端线速改变 **6 ms**（TCP 侧同口径 8 ms），比
+`doca_pcc_mailbox_send` 这个阻塞调用自己返回还早——**那 13.5 ms 是主机侧阻塞的
+时长，不在控制路径上**，它只限制刷新频率。看到收敛长尾不要再往这里记。
+
+**$N$ 必须单向（涨得快、跌得慢）。** `level=budget/N` 里 $N$ 估低会让每条 QP 分得
+更多，流对因此**越过围栏**——这是设计承诺不会发生的事。被限速越狠的 QP 抬事件越
+稀，正在发送的 QP 也会偶尔掉出活跃窗口：实测冻结预算、十条 QP 满发时，$N$ 读到
+10 占 92.4%、读 9 占 5.2%、读 8 占 2.4%，对应超发 11% 与 25%，开环下就把线速抖出
+9%。所以 $N$ 一见到 QP 立刻上调、只在低读数连续站住 64 个 epoch 后才下调。
 
 **诊断邮箱**：`0xdeb <pair>` 回读 {flowtag, budget, level, remote_rx, r_units,
 cc_rate, epochs, cap, α, Rt, stage}；`0xdec <pair>` 回读 {cnp_any, cnp_hits,
@@ -205,7 +255,7 @@ rtt_n}。**tx agent 在跑时查询不可靠**——它每 13ms 往同一个 FIF
 | 症状 | 先查 |
 |---|---|
 | 授权对、线上不对（预算照收、level 照读） | RP 陈旧 → 重启 RP |
-| 收敛长尾 >10s，三层读数都正确 | 预算陈旧应用形态 |
+| 收敛长尾 >10s，三层读数都正确 | 预算陈旧应用形态（RP 是否该重启）；**不要再怀疑执行面爬坡，那条路已经是一步赋值** |
 | n 个 QP 的流跑到 n 倍份额 | `qpn_resolver` 是否在位 |
 | RoCE 建连成功但零吞吐 + CQE error | VF MTU 是不是 1500 |
 | 某几对 RDMA 报 Completion with error 且永不恢复 | 启动瞬态聚合过载，加 `--rate_limit` |
@@ -215,6 +265,10 @@ rtt_n}。**tx agent 在跑时查询不可靠**——它每 13ms 往同一个 FIF
 | 类分队列不成立、流量全在 TC0 | `tos=inherit` |
 | 交叉对实验的归属全落在直连对上 | 用了 `-R`，改 `-x <gid>` |
 | 某个 VF 抢答别人的 ARP、流集全落 vf0 | `cross_pair_net.sh apply` 没做 |
+| 加入事件里 TCP 首字节晚约 1 s、接收端那段时间零字节 | iperf3 没带 `--start-at`（用 `strings` 查库，别查 `--help`） |
+| 新流接纳延迟同配置下从 150 ms 跳到 1100 ms | 接收端 OVS meter 的 police 卸载失败（查 vswitchd 日志的 `police action`） |
+| 一条流对跑到超过自己份额，而账本与预算都正确 | 设备端 `N` 读低了（`0xded` 读回 level，`预算/level` 就是 N） |
+| RDMA 归因抖动远大于 TCP，且控制环停掉也还在 | 同上，先在冻结预算下量 level 稳不稳 |
 
 ## Jakiro DHTB（对照环境）
 
