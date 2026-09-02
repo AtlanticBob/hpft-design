@@ -177,6 +177,16 @@ OVS drop meter，而这套 OVS（`doca-openvswitch 3.4.0040`，内核数据面 +
 
 **不要拿没接好的 VF 做实验。** 在 vf5 上试的时候，接收端算出了 e = 25 G，但发送端 agent 的 Ehat = 0、围栏停在 2 G 地板、预算 0，RDMA 执行面里根本没有这个 pair 的条目，于是四条 QP 走"未知流"兜底额度（每 QP 5 G）跑到 19.36 G——**实际速率是围栏的 9 倍，围栏一点没生效**。原因还没查（可能只是这个 VF 对没进管理集合），但结论是实验必须用 vf0–vf3 这种在场景里跑熟的 VF，并且走 `validation/run/run.sh` 的完整装配，别手工起流。
 
+## 执行面的 CC 项与丢包
+
+**四个 CC 项现在都会因丢包降速**（`0xccd`：0 = AIMD、1 = ZTR、2 = DCQCN RP 状态机、3 = Swift；启动路径里没人写 `0xccd`，缺省是编译期默认值 **2**）。ZTR 和 Swift 在自己的 RTT 事件里处理；AIMD 与 DCQCN 走 2026-09-02 加的 **slow restart**：NACK 事件里乘性压低 `Rc`、恢复阶梯清零、重置速率定时器，**不碰 alpha**（alpha 估计的是标记强度，丢包不是标记）。
+
+这么组织是照着硬件来的：固件的丢包反应在 ROCE_ACCL 寄存器的 `roce_slow_restart_en`（本 lab 四台都是 1），与 DCQCN 并列；`ecn/roce_rp/` 下十七个 DCQCN 旋钮无一与丢包有关。所以丢包反应加在状态机旁边，不加在里面。
+
+两个参数：`0xcce <fxp16> 8` 是切幅（默认 32768 = 0.5，取自固件的 `rpg_min_dec_fac = 50`），`0xcce <us> 9` 是两次切之间的最小间隔（默认 300 µs，与 `rpg_time_reset` 同量级）。**节流不能去掉**：隐形瓶颈下 NACK 能到每秒 1.9 万次，每次都切会把速率瞬间钉在地板。切幅设 65536 就是关掉。诊断计数 `dq_n_loss` 在 `0xded` 回读的第 9 个字，`rp_probe.py` 吐成 `sr_cuts`。
+
+**这两个参数还没有对着固件标定过**，初值是从固件旋钮借的。要做到软件像固件，得把 lab 切到 UPCC=0 跑同一个隐形瓶颈场景量固件的 goodput / NACK 率 / 恢复形状，再回来调。切 UPCC 要 `mlxfwreset`，而 fw reset 会清掉 ROCE_ACCL 的 SR 位，回来要 `cc_mode.sh sr` 重设。
+
 ## perftest 的坑
 
 - **2026-09-02 起打流器统一是 `~/hyperfront/perftest-enhanced`**，四台同一份二进制。
