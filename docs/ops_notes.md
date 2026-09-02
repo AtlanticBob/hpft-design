@@ -224,7 +224,7 @@ $rate=\operatorname{clip}(cc,\ (1-T)\cdot level,\ level)$——上界恒等于 l
 置信度字），走 `trust_mode` 分支。
 
 **置信度靠丢包维持、停了就自动退**（design v4 §6.2/6.3，2026-09-02 起）：上升
-三条件（队列为零、`cc_rate` 低于 level 2% 以上、最近 100 ms 有 NACK）成立的每个
+三条件（队列为零、`cc_rate` 低于 level 的 $1-\delta$（$\delta$ = 15%，与注册表 `delta_demand` 同值）、最近 100 ms 有 NACK）成立的每个
 1 ms epoch 涨 $(1-T)\cdot$步长，不成立的每个 epoch 按 $T\cdot\max(q/D,\ \text{过期步长})$
 降。两个步长都是 fxp16/epoch 的邮箱旋钮：`0xcce <步长> 7` 是上升（默认 66 =
 $\tau_r$ 1 s；0 = 置信度冻结在零，V8 臂 B），`0xcce <步长> 10` 是过期（默认 13 =
@@ -232,7 +232,10 @@ $\tau_d$ 5 s；0 = 关掉过期项，即 2026-09-02 之前只有队列一条下�
 V9 臂 B）。过期项必须在的原因：瓶颈消失时网络不给任何新信号，而置信度高的流又
 永远不会多拿（上界恒为 level），没有过期项置信度就只有上去的路、没有下来的路——
 实测旧规则下瓶颈撤掉后 $T$ 十几分钟才消退（时间常数约 278 s），这期间下界保护
-一直是关着的。
+一直是关着的。TCP 执行面（`hpft_tcp_edt_kern.c`）是同一套规则的编译期常量版：
+`HPFT_TRUST_STEP` 66、`HPFT_TRUST_DECAY` 13、`HPFT_TRUST_BELOW_FXP16` 55706、空闲
+超过 `HPFT_TRUST_IDLE_NS` 5 s 从零起（design v4 §6.4）；改它要重编 .o 并按
+"EDT 重装"步骤在四台 host 上重装。
 
 两条对照臂仍在设备码里：`0xcca 1` 是旧的观测耦合 $rate=d\cdot level$，`0xcca 0`
 是基线 `min(cc_rate, level)`。**注意设备码里 `trust_mode` 字段旁的注释写着
