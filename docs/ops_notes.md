@@ -168,6 +168,14 @@ OVS drop meter，而这套 OVS（`doca-openvswitch 3.4.0040`，内核数据面 +
 
 ## perftest 的坑
 
+- **2026-09-02 起打流器统一是 `~/hyperfront/perftest-enhanced`**，四台同一份二进制。
+  它是原封的 perftest 6.28 加三样东西：每 QP 带宽时序（`--report-per-qp`）、大 QP 数
+  下的并行建链（`--setup-threads`）、准点起步（`--start_at`）。`perftest-26015` 已停用，
+  只作已跑完的 motivation 包的历史记录。
+- **`--rate_limit` 一定要确认软件限速真的接管了。** 在 RoCE 上硬件限速必然被 QP 拒绝
+  （PCC 执行面占着 QP 的速率），perftest 于是退回软件限速并在 stderr 上打
+  "providing SW rate limit"。**看不到这行就是没限住**——限速值会被完全忽略，流照着
+  线速发。
 - `-D` 两端必须一致，不一致报 "Failed to negotiate parameters"。
 - `-D` 模式下结果表的 iterations 列不可靠（约为真实消息数的一半），总量用
   BW average × 时长算。
