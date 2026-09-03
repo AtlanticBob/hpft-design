@@ -116,7 +116,7 @@ VxLAN encap 路径：QP 建连成功、数据 WQE 全部 CQE flush error、字�
 `ethtool -S p1` 的 `rx_bytes_phy`。
 
 **VxLAN 封装税实测 4.99%**（65536B 消息、MTU 1500）。账本与 pace 全链是内层口径
-且自洽，外层税只在 root 容量层面由 headroom 吸收——**不要给 TCP shaper 单独加
+且自洽，外层税只在 root 容量层面由预留余量（headroom）吸收——**不要给 TCP shaper 单独加
 外层补偿**，那会重造 TCP↔RDMA 不对称（RDMA 硬件调速计不了外层）。
 
 **多 VF 并发 TCP 一律 `%dev` 强绑定**（`-B 10.1.N.x%dpu1vfN`）。只绑源 IP 时
