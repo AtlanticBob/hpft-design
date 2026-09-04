@@ -329,3 +329,8 @@ rtt_n}。**tx agent 在跑时查询不可靠**——它每 13ms 往同一个 FIF
 3. 探针复用 iperf3 server 会踩"单 test 服务"陷阱（被 timeout 掐死的客户端让 server
    卡住，其后探测全零）——每次探测前 kill 重起。
 4. Arm 重启后 hugepages 需 ≥4GB（2048×2MB），否则先死在 EAL、补 2GB 仍死在 mbuf 池。
+
+## 交换机一分为二（2026-09-04 起）
+
+sn5600 用一根 OSFP 800G 线自回环（`swp21`↔`swp25`），主机口分进两个 VLAN：A 侧 101 = sgpu01（`swp37s1`）+ sgpu03（`swp3s1`），B 侧 102 = sgpu02 接收端（`swp37s0`）+ sgpu04（`swp4s1`）。两侧之间只有这根线，它就是接收端账本管不到的核心链路。三条硬规矩：回环两头**必须在不同 VLAN**，并且两个口都开 `bpdu-filter`——br_default 跑 RSTP，不这样做交换机会把自己发出的 BPDU 当环路、阻塞一个口；回环口 MTU 9216（底层 VxLAN 走 DPU 的 p1，9000）；VF 的 MTU 仍是 1500，巨帧测试要在 DPU 的 p1 之间做（172.16.1.x）。29 号口不能用作回环：它拆成了 2×400G 并挂着旧的自适应路由和 vrf2。脚本（插线前 / 切换 / 回退 / 校验）、端口表和改线前的配置备份都在 `hpft-implementation/tools/lab-infra/switch/`。切换后的校验：跨侧巨帧零丢包，TCP 单对 46.9 G（重传来自 VF 的 50 G 限速器，同侧的一对更多），RDMA 单对 45.6 G。回环口现在没有 ECN、没有 PFC，速率 800G；要让核心成为瓶颈得把它压低，单口能配的档位还没验证。
+
