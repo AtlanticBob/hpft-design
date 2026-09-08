@@ -4,19 +4,17 @@ The design document (`design_v4_en.md`) says what the system does and why each r
 
 ## 1 What the control is mathematically
 
-It consists of three parts running on three different time scales.
+It consists of two parts running on two different time scales.
 
 The **fast loop** acts once per feedback. Its state is the log ratio of the permitted rate to the entitlement, $x=\ln(R/E)$, and the normalised queue $q$. It has two regimes. With a non-empty queue ($q>0$) the loop has a usable error signal and is a damped second-order loop. With an empty queue ($q=0$) the loop carries no information about the share at all, and the only option is to probe blindly, with a step set by how long the queue has been empty.
 
-The **slow loop** acts on the executor's own tick. Its state is the confidence $T$. It does not change the permitted rate; it changes only how far below the permitted rate the executor lets the tenant's congestion control go. Its inputs are loss (raising it) and the queue and time (lowering it); its output goes only into the executor's lower bound.
-
 The **local allocation** is recomputed once per observation window and is constant across any single feedback of the fast loop.
 
-Keeping the three time scales apart is the premise of every result below; Section 5 states it as a condition.
+Keeping the two time scales apart is the premise of every result below; Section 5 states it as a condition. The tenant's congestion control reacts below the permitted rate on the scale of a round-trip time and belongs to neither loop: the executor's token bucket (design document, Section 6) only cuts it off when it asks for more than the permitted rate.
 
 ## 2 Non-empty queue: a second-order loop
 
-Assume the flow is bounded by the permitted rate ($A\approx R$, zero confidence). Per feedback, the queue changes by the ratio of arrival to entitlement minus one:
+Assume the flow set is bounded by the permitted rate (the bucket binds, $A\approx R$). Per feedback, the queue changes by the ratio of arrival to entitlement minus one:
 
 $$\Delta q=\frac{A-E}{E}\approx x .$$
 
@@ -52,15 +50,17 @@ There is only one way out: the step must depend on information, and the only inf
 
 The steady-state sawtooth follows: the permitted rate overshoots the share by about the step at the moment of crossing times the delay, $\alpha m_c\tau$.
 
-## 4 Three properties
+## 4 Four properties
 
-The following hold for any tenant congestion control satisfying the premises of Section 1 of the design document, regardless of parameter values.
+The following hold for any tenant congestion control satisfying the premises of Section 1 of the design document, regardless of parameter values. Write $c_i$ for the quotas of the flows of one flow set and $r_i=c_i\min(1,R/\sum_j c_j)$ for the ceilings the bucket gives them.
 
-**Property 1: fairness cannot be bought.** The wire rate is $r=\operatorname{clip}(c,(1-T)R,R)$, so for any confidence and any quota $c$ the congestion control produces, $r\le R$. The upper end is the permitted rate at every confidence; a more aggressive congestion control only raises $c$, and the excess is cut off with no effect on the wire. This turns fairness from an equilibrium that holds only if the other side also plays by the rules into an invariant enforced from one side. The excess has two bounds, both set directly by parameters: the instantaneous excess is at most $\alpha_{\max}\tau$ (Section 3), and the cumulative excess is at most $D$ periods of entitlement, because the virtual queue is clipped at $D\,E$. The ledger is a bounded memory, not a debt.
+**Property 1: fairness cannot be bought.** For any $c_i$, $\sum_i r_i=\min(\sum_i c_i,\ R)\le R$: a flow set's wire rate never exceeds the permitted rate, whatever the kind, aggressiveness or number of its congestion controls. A more aggressive congestion control only raises $c_i$, and the excess is cut off by the bucket with no effect on the wire. This turns fairness from an equilibrium that holds only if the other side also plays by the rules into an invariant enforced from one side. The excess has two bounds, both set directly by parameters: the instantaneous excess is at most $\alpha_{\max}\tau$ (Section 3), and the cumulative excess is at most $D$ periods of entitlement, because the virtual queue is clipped at $D\,E$. The ledger is a bounded memory, not a debt.
 
-**Property 2: transparent to the tenant's congestion control, with bounded yielding.** When $c$ lies inside the interval, $r=c$, untouched: the tenant's congestion control sees the network responding to exactly the rate it chose, and its control loop stays intact. The other half is the lower bound $r\ge(1-T)R$: a flow can be pushed below its share by its own congestion control only by the amount we explicitly grant, so a congestion control that only ever ratchets down cannot drag the flow to zero. The upper bound protects others from this flow; the lower bound protects this flow from its own congestion control; in between, nothing is touched.
+**Property 2: full delivery.** When $\sum_i c_i\ge R$, $\sum_i r_i=R$: as long as the flows together ask for enough, the wire carries the permitted rate. A flow that asks for less draws more slowly, and the difference goes to the other flows in proportion to their $c_i$, with no redistribution rule of any kind.
 
-**Property 3: confidence is a one-way permission, hence fail-safe.** Confidence lets a flow send less, never more, so granting it is always safe for everyone else: if the estimate is wrong, the flow itself pays. The error in the other direction, a hidden bottleneck that really exists while we keep pushing the permitted rate, is corrected by loss, a fact of the network and not the private signal of any congestion control. The same asymmetry forces confidence to expire on its own. Loss can prove that a bottleneck exists, but when the bottleneck disappears no new signal appears anywhere; the only change is that loss stops. And a flow with high confidence, whose upper bound is still the permitted rate, can never trigger the "took too much" path down. So confidence is held up by recurring evidence and, when the evidence stops, decays to zero with time constant $\tau_d$. The cost is that a bottleneck that still exists but has stopped dropping is gently re-probed from time to time.
+**Property 3: transparent to the tenant's congestion control, and proportional.** When $\sum_i c_i\le R$, $r_i=c_i$, untouched: the tenant's congestion control sees the network responding to exactly the rate it chose, and its control loop stays intact. When $\sum_i c_i>R$, $r_i/r_j=c_i/c_j$: the flows stand in the same ratio they would settle to on a bottleneck of capacity $R$ by themselves. The executor has no policy inside the flow set.
+
+**Property 4: neither delayed nor amplified.** $r_i$ is a pointwise function of $c_i$ with no state: every move of the congestion control below $R$ lands on the wire as it is; the executor neither smooths it nor sends more on its behalf. Conversely, the executor cannot take a flow set above the sum of its congestion controls: when $\sum_i c_i<R$ the flow set delivers less than $R$. That is not a failure of the executor; the ledger counts what arrives, and a flow set is judged a lender only when its retreat exceeds the tolerance $\delta$ (design document, Section 4.4).
 
 ## 5 Scale invariance
 
@@ -88,7 +88,7 @@ $$\kappa=\frac{0.4}{\tau},\qquad D=\frac{4\zeta^{2}}{\kappa},\qquad \alpha_{\max
 
 $m_{\max}$ is the one quantity set by policy rather than physics: how long a silence before you are confident the share has really moved. The causes of share changes (flows joining and leaving, tenants added and removed) are all much slower than a second, so one second is used.
 
-The remaining parameters are independent of the loop and are set on their own. $\delta$ is clearly larger than the executor's delivery shortfall plus measurement jitter. $h$ is the encapsulation overhead plus the margin that lets the ledger warn before the switch queue. $\tau_r$ is much larger than the fast loop's settling time $D$, or the two loops interfere. $\tau_d$ is much larger than $\tau_r$, or the gap between two losses would drain confidence that has just been raised.
+The remaining parameters are independent of the loop and are set on their own. $\delta$ is clearly larger than the executor's delivery shortfall plus measurement jitter, and must also cover how far a congestion control backs off at the managed port. $h$ is the encapsulation overhead plus the margin that lets the ledger warn before the switch queue. The executor itself has no parameters.
 
 **Worked example.** $T_p=10$ ms, $\tau_{\text{wall}}\approx30$ ms, so $\tau=3$ feedbacks: $\kappa\approx0.13$, rounded to 0.1; $D\approx30$; $\alpha_{\max}\approx0.03$; $m_{\max}=100$ and $\alpha=3\times10^{-4}$. These match the design document's parameter table line by line.
 
@@ -102,8 +102,8 @@ The remaining parameters are independent of the loop and are set on their own. $
 
 **The second-order loop is a small-signal approximation.** $e^{x}-1\approx x$ holds for moderate $|x|$. A large disturbance such as the share halving is at the edge of the approximation; the actual repayment is somewhat more aggressive than the linear prediction, which is the safe direction, but quantitative sawtooth predictions should not be trusted under large disturbances.
 
-**The separation of the three time scales is uneven.** The fast loop settles in $D$ feedbacks; the local allocation is recomputed once per observation window, an order of magnitude slower than one feedback but faster than the fast loop's settling; confidence rises only a few times slower than the fast loop settles. Strict separation holds only at the level of "the local allocation is constant across one feedback". That is why the local cap applies increases at once and rate-limits decreases: the asymmetry is what keeps it from fighting the fast loop in practice.
+**The separation of the two time scales is uneven.** The fast loop settles in $D$ feedbacks; the local allocation is recomputed once per observation window, an order of magnitude slower than one feedback but faster than the fast loop's settling. Strict separation holds only at the level of "the local allocation is constant across one feedback". That is why the local cap applies increases at once and rate-limits decreases: the asymmetry is what keeps it from fighting the fast loop in practice.
 
-**Property 1 relies on an honest executor.** $r\le R$ is the executor's arithmetic and holds only if the executor actually shapes to $r$. A defect inside the executor can breach the bound without violating any design rule, and only measurement can find it.
+**Property 1 relies on an honest executor.** $\sum_i r_i\le R$ is the executor's arithmetic and holds only if the executor actually shapes to $r$. A defect inside the executor can breach the bound without violating any design rule, and only measurement can find it.
 
 **The receiver's measurement accuracy is outside the model.** The analysis takes $A$ to be the flow set's true arrival. Measurement error enters $q$ directly; it is the source of the residual steady-state jitter and the reason that jitter cannot be tuned away.
